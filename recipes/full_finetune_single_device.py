@@ -311,6 +311,11 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
 
         # sampler and dataloader depend on the tokenizer and loss_fn and should be
         # setup after both of these are initialized
+        if isinstance(cfg.dataset.get("_component_", None), str):
+            if cfg.dataset.get("_component_", None)[0]=='[' and cfg.dataset.get("_component_", None)[-1]==']':
+                from omegaconf import OmegaConf
+                cfg.dataset["_component_"] = OmegaConf.create(cfg.dataset['_component_'])
+
         cfg.dataset["split"] = "train"  # NOTE: added by us
         collate_name = cfg.get("collate_fn", "torchtune.data.padded_collate_sft")
         self._sampler, self._dataloader = self._setup_data(
@@ -347,7 +352,6 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                 collate_fn = _get_component_from_path(collate_name)
                 self._dataloader_validation_list[i] = DataLoader(subset, batch_size=cfg.batch_size,shuffle=False, collate_fn=collate_fn)
         else:
-            print("WARNING: Validation dataset is not a list.")
             cfg["validation_dataset"]["split"] = "validation"
             sampler_validation, dataloader_validation = self._setup_data(
                 cfg_dataset=cfg["validation_dataset"],
@@ -608,18 +612,18 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         iterable datasets and streaming datasets are not supported.
         """
 
-        def update_component_key(obj):
-            """
-            Update the key '._component_' to '_component_' in the dictionary.
-            """
-            if "._component_" in obj:
-                obj["_component_"] = obj.pop("._component_")
+        # def update_component_key(obj):
+        #     """
+        #     Update the key '._component_' to '_component_' in the dictionary.
+        #     """
+        #     if "._component_" in obj:
+        #         obj["_component_"] = obj.pop("._component_")
 
-            for key, value in obj.items():
-                if isinstance(value, dict):
-                    update_component_key(value)
+        #     for key, value in obj.items():
+        #         if isinstance(value, dict):
+        #             update_component_key(value)
 
-            return obj
+        #     return obj
 
         def convert_to_nested(config):
             """
@@ -632,7 +636,6 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             Returns:
                 dict: A dictionary with nested keys.
             """
-            # print('cfg in the convert_to_nested:', config)
             nested_config = {}
 
             for key, value in config.items():
@@ -648,14 +651,13 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
 
             return nested_config
 
-        # print('cfg begining of the setup data:', cfg_dataset)
         if isinstance(cfg_dataset.get("_component_", None), ListConfig):
             portions = []
             datasets = []
             for single_cfg_dataset in cfg_dataset["_component_"]:
                 single_cfg_dataset = DictConfig(
                     convert_to_nested(
-                        update_component_key(deepcopy(single_cfg_dataset))
+                        deepcopy(single_cfg_dataset)
                     )
                 )
 
@@ -665,19 +667,17 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                     else None
                 )
                 portions.append(portion)
-                print('cfg in the list of setup data:', single_cfg_dataset)
                 datasets.append(
                     config.instantiate(
                         single_cfg_dataset,
                         self._tokenizer,
                     )
                 )
-            # print('Portions is:', portions)
             ds = ConcatDataset(datasets=datasets, portions=portions)
             packed = False
         else:
             new_single_cfg_dataset = DictConfig(
-                convert_to_nested(update_component_key(deepcopy(cfg_dataset)))
+                convert_to_nested(deepcopy(cfg_dataset))
             )
             new_single_cfg_dataset.pop("portion", None)
             ds = config.instantiate(new_single_cfg_dataset, self._tokenizer)
@@ -1027,7 +1027,6 @@ def recipe_main(cfg: DictConfig) -> None:
         - Parameters specified in config (see available configs through ``tune ls``)
         - Overwritten by arguments from the command-line
     """
-    # print('Cfg in recipe_main:', cfg)
     config.log_config(recipe_name="FullFinetuneRecipeSingleDevice", cfg=cfg)
     recipe = FullFinetuneRecipeSingleDevice(cfg=cfg)
     recipe.setup(cfg=cfg)
@@ -1036,5 +1035,4 @@ def recipe_main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    # print('In full finetune recipe')
     sys.exit(recipe_main())
