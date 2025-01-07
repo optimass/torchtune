@@ -344,7 +344,11 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                 self._dataloader_validation_list.append(dataloader_validation)
             # downsample the validation using the portion property in the dataset config
             for i in range(1,len(self._sampler_validation_list)): # hardcoding the first portion to be the training portion
-                sample_size = int(len(self._dataloader_validation_list[0].dataset) * portions[i] / (1-sum(portions[1:]))) # hardcoding the first portion to be the training portion
+                if portions[i] == 0:
+                    sample_size = min(1028, int(len(self._dataloader_validation_list[i].dataset))) # hardcoding the default sample size to 1028 if the portion is 0
+                else:
+                    sample_size = int(len(self._dataloader_validation_list[0].dataset) * portions[i] / (1-sum(portions[1:]))) # hardcoding the first portion to be the training portion
+    
                 if sample_size > len(self._dataloader_validation_list[i].dataset):
                     continue
                 random.seed(42)
