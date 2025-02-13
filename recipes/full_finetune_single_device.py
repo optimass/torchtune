@@ -616,19 +616,6 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         iterable datasets and streaming datasets are not supported.
         """
 
-        # def update_component_key(obj):
-        #     """
-        #     Update the key '._component_' to '_component_' in the dictionary.
-        #     """
-        #     if "._component_" in obj:
-        #         obj["_component_"] = obj.pop("._component_")
-
-        #     for key, value in obj.items():
-        #         if isinstance(value, dict):
-        #             update_component_key(value)
-
-        #     return obj
-
         def convert_to_nested(config):
             """
             Converts a flattened dictionary (e.g., 'column_map.output')
@@ -876,7 +863,6 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                     )
                     pbar_val.close()
                     print("Number of samples that were too long: ", max_len_samples)
-            # -------------------- CHANGE ABOVE FOR VALIDATION MUTIPLE DATA LOADERS ---------------------#
             # ------ Training Epoch ------ #
             # Initialize tokens count and running loss (for grad accumulation)
             t0 = time.perf_counter()
