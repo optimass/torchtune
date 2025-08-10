@@ -91,6 +91,22 @@ _ALL_RECIPES = [
                 name="llama3_2_vision/11B_full_single_device",
                 file_path="llama3_2_vision/11B_full_single_device.yaml",
             ),
+            Config(
+                name="qwen3/0.6B_full_single_device",
+                file_path="qwen3/0.6B_full_single_device.yaml",
+            ),
+            Config(
+                name="qwen3/1.7B_full_single_device",
+                file_path="qwen3/1.7B_full_single_device.yaml",
+            ),
+            Config(
+                name="qwen3/4B_full_single_device",
+                file_path="qwen3/4B_full_single_device.yaml",
+            ),
+            Config(
+                name="qwen3/8B_full_single_device",
+                file_path="qwen3/8B_full_single_device.yaml",
+            ),
         ],
         supports_distributed=False,
     ),
@@ -120,6 +136,10 @@ _ALL_RECIPES = [
             Config(name="qwen2_5/1.5B_full", file_path="qwen2_5/1.5B_full.yaml"),
             Config(name="qwen2_5/3B_full", file_path="qwen2_5/3B_full.yaml"),
             Config(name="qwen2_5/7B_full", file_path="qwen2_5/7B_full.yaml"),
+            Config(name="qwen3/0.6B_full", file_path="qwen3/0.6B_full.yaml"),
+            Config(name="qwen3/1.7B_full", file_path="qwen3/1.7B_full.yaml"),
+            Config(name="qwen3/4B_full", file_path="qwen3/4B_full.yaml"),
+            Config(name="qwen3/8B_full", file_path="qwen3/8B_full.yaml"),
             Config(
                 name="llama3_2_vision/11B_full",
                 file_path="llama3_2_vision/11B_full.yaml",
