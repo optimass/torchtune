@@ -27,6 +27,7 @@ from torchtune.datasets._text_completion import (
 )
 from torchtune.datasets._wikitext import wikitext_dataset
 from torchtune.datasets._grpo import grpo_dataset
+from torchtune.datasets._privilaged import priv_dataset
 
 __all__ = [
     "alpaca_dataset",
@@ -51,6 +52,7 @@ __all__ = [
     "reinforce_dataset",
     "trajectory_dataset",
     "prime_dataset",
-    "grpo_dataset"
+    "grpo_dataset",
+    "priv_dataset"
 
 ]

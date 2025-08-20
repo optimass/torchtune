@@ -12,7 +12,6 @@ from torchtune.data._common import CROSS_ENTROPY_IGNORE_IDX, PACK_TYPE
 from torchtune.modules.attention_utils import packed_block_causal_mask
 
 
-
 def left_pad_sequence(
     sequences: List[torch.Tensor],
     batch_first: bool = False,
@@ -150,9 +149,9 @@ def padded_collate(
         output_dict[k] = pad_fn(
             [torch.tensor(x[k]) for x in batch],
             batch_first=True,
-            padding_value=padding_idx[k]
-            if isinstance(padding_idx, dict)
-            else padding_idx,
+            padding_value=(
+                padding_idx[k] if isinstance(padding_idx, dict) else padding_idx
+            ),
         )
     return output_dict
 
@@ -564,7 +563,6 @@ def padded_collate_dpo(
     return concatenated_input_ids, concatenated_labels
 
 
-
 def padded_collate_traj_dpo(
     batch: List[Dict[str, List[int]]],
     padding_idx: int = 0,
@@ -605,10 +603,11 @@ def padded_collate_traj_dpo(
         >>>          [18, 19, 20]]))
     """
     chosen_input_ids = [torch.tensor(e) for ex in batch for e in ex["chosen_input_ids"]]
-    rejected_input_ids = [torch.tensor(e) for ex in batch for e in ex["rejected_input_ids"]]
+    rejected_input_ids = [
+        torch.tensor(e) for ex in batch for e in ex["rejected_input_ids"]
+    ]
     chosen_labels = [torch.tensor(e) for ex in batch for e in ex["chosen_labels"]]
     rejected_labels = [torch.tensor(e) for ex in batch for e in ex["rejected_labels"]]
-    
 
     to_pad_input_ids = chosen_input_ids + rejected_input_ids
     to_pad_labels = chosen_labels + rejected_labels
@@ -620,12 +619,11 @@ def padded_collate_traj_dpo(
         to_pad_labels, batch_first=True, padding_value=ignore_idx
     )
 
-    return concatenated_input_ids, concatenated_labels, [len(chosen_input_ids), len(rejected_input_ids)]
-
-
-
-
-
+    return (
+        concatenated_input_ids,
+        concatenated_labels,
+        [len(chosen_input_ids), len(rejected_input_ids)],
+    )
 
 
 def padded_collate_traj_CE(
@@ -669,10 +667,9 @@ def padded_collate_traj_CE(
     """
     chosen_input_ids = [torch.tensor(e) for ex in batch for e in ex["chosen_input_ids"]]
     chosen_labels = [torch.tensor(e) for ex in batch for e in ex["chosen_labels"]]
-    ce_label=[torch.tensor(ex["ce_label"]) for ex in batch]
-    
+    ce_label = [torch.tensor(ex["ce_label"]) for ex in batch]
 
-    to_pad_input_ids = chosen_input_ids 
+    to_pad_input_ids = chosen_input_ids
     to_pad_labels = chosen_labels
 
     concatenated_input_ids = pad_sequence(
@@ -682,7 +679,7 @@ def padded_collate_traj_CE(
         to_pad_labels, batch_first=True, padding_value=ignore_idx
     )
 
-    return concatenated_input_ids, concatenated_labels , ce_label
+    return concatenated_input_ids, concatenated_labels, ce_label
 
 
 def padded_collate_reinforce(
@@ -690,7 +687,7 @@ def padded_collate_reinforce(
     padding_idx: int = 0,
     ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
 ) -> Dict[str, torch.Tensor]:
-    
+
     input_ids = pad_sequence(
         [torch.tensor(x["tokens"]) for x in batch],
         batch_first=True,
@@ -701,7 +698,9 @@ def padded_collate_reinforce(
         batch_first=True,
         padding_value=ignore_idx,
     )
-    reward=torch.tensor([torch.tensor(x["reward"]).unsqueeze(0) for x in batch]).unsqueeze(0)
+    reward = torch.tensor(
+        [torch.tensor(x["reward"]).unsqueeze(0) for x in batch]
+    ).unsqueeze(0)
 
     input_ids_seq_len = input_ids.shape[-1]
     labels_seq_len = labels.shape[-1]
@@ -720,6 +719,142 @@ def padded_collate_reinforce(
     return {"tokens": input_ids.long(), "labels": labels.long(), "reward": reward}
 
 
+def padded_collate_privilege(
+    batch: List[Dict[str, Any]],
+    padding_idx: int = 0,
+    ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
+) -> Dict[str, Any]:
+    """
+    Collate function for the privilege dataset.
+    This function takes a batch of samples from `priv_dataloader` and collates them
+    into padded tensors for both 'with_privilege' and 'without_privilege' scenarios.
+    """
+    # Collate 'with_privilege' data
+    tokens_wp = [torch.tensor(x["with_privilege"]["tokens"]) for x in batch]
+    labels_wp = [torch.tensor(x["with_privilege"]["labels"]) for x in batch]
+    padded_tokens_wp = pad_sequence(
+        tokens_wp, batch_first=True, padding_value=padding_idx
+    )
+    padded_labels_wp = pad_sequence(
+        labels_wp, batch_first=True, padding_value=ignore_idx
+    )
+
+    len_tokens_wp = padded_tokens_wp.shape[-1]
+    len_labels_wp = padded_labels_wp.shape[-1]
+    if len_tokens_wp > len_labels_wp:
+        padded_labels_wp = F.pad(
+            padded_labels_wp, (0, len_tokens_wp - len_labels_wp), value=ignore_idx
+        )
+    elif len_labels_wp > len_tokens_wp:
+        padded_tokens_wp = F.pad(
+            padded_tokens_wp, (0, len_labels_wp - len_tokens_wp), value=padding_idx
+        )
+
+    # Collate masks and action positions for 'with_privilege' data
+    masks_wp = [x["with_privilege"]["mask"] for x in batch]
+    action_start_pos_wp = torch.tensor(
+        [x["with_privilege"]["action_start_pos"] for x in batch]
+    )
+    action_end_pos_wp = torch.tensor(
+        [x["with_privilege"]["action_end_pos"] for x in batch]
+    )
+    end_of_prompt_wp = torch.tensor(
+        [x["with_privilege"]["end_of_prompt"] for x in batch]
+    )
+
+    # Pad masks to match token length
+    padded_masks_wp = []
+    for mask in masks_wp:
+        mask_tensor = torch.tensor(mask, dtype=torch.bool)
+        if len(mask_tensor) < len_tokens_wp:
+            mask_tensor = F.pad(
+                mask_tensor, (0, len_tokens_wp - len(mask_tensor)), value=True
+            )
+        padded_masks_wp.append(mask_tensor)
+    padded_masks_wp = torch.stack(padded_masks_wp)
+
+    collated_wp = {
+        "tokens": padded_tokens_wp.long(),
+        "labels": padded_labels_wp.long(),
+        "mask": padded_masks_wp,
+        "action_start_pos": action_start_pos_wp,
+        "action_end_pos": action_end_pos_wp,
+        "end_of_prompt": end_of_prompt_wp,
+    }
+
+    # Collate 'without_privilege' data
+    tokens_np = [torch.tensor(x["without_privilege"]["tokens"]) for x in batch]
+    labels_np = [torch.tensor(x["without_privilege"]["labels"]) for x in batch]
+    padded_tokens_np = pad_sequence(
+        tokens_np, batch_first=True, padding_value=padding_idx
+    )
+    padded_labels_np = pad_sequence(
+        labels_np, batch_first=True, padding_value=ignore_idx
+    )
+
+    len_tokens_np = padded_tokens_np.shape[-1]
+    len_labels_np = padded_labels_np.shape[-1]
+    if len_tokens_np > len_labels_np:
+        padded_labels_np = F.pad(
+            padded_labels_np, (0, len_tokens_np - len_labels_np), value=ignore_idx
+        )
+    elif len_labels_np > len_tokens_np:
+        padded_tokens_np = F.pad(
+            padded_tokens_np, (0, len_labels_np - len_tokens_np), value=padding_idx
+        )
+
+    # Collate masks and action positions for 'without_privilege' data
+    masks_np = [x["without_privilege"]["mask"] for x in batch]
+    action_start_pos_np = torch.tensor(
+        [x["without_privilege"]["action_start_pos"] for x in batch]
+    )
+    action_end_pos_np = torch.tensor(
+        [x["without_privilege"]["action_end_pos"] for x in batch]
+    )
+    end_of_prompt_np = torch.tensor(
+        [x["without_privilege"]["end_of_prompt"] for x in batch]
+    )
+
+    # Pad masks to match token length
+    padded_masks_np = []
+    for mask in masks_np:
+        mask_tensor = torch.tensor(mask, dtype=torch.bool)
+        if len(mask_tensor) < len_tokens_np:
+            mask_tensor = F.pad(
+                mask_tensor, (0, len_tokens_np - len(mask_tensor)), value=True
+            )
+        padded_masks_np.append(mask_tensor)
+    padded_masks_np = torch.stack(padded_masks_np)
+
+    collated_np = {
+        "tokens": padded_tokens_np.long(),
+        "labels": padded_labels_np.long(),
+        "mask": padded_masks_np,
+        "action_start_pos": action_start_pos_np,
+        "action_end_pos": action_end_pos_np,
+        "end_of_prompt": end_of_prompt_np,
+    }
+
+    rewards = torch.tensor([x["reward"] for x in batch])
+    goals = [x["goal"] for x in batch]
+    privileged_found = torch.tensor(
+        [x.get("privileged_found", 0) for x in batch]
+    ).long()
+    trajectory_index = torch.tensor(
+        [x.get("trajectory_index", 0) for x in batch]
+    ).long()
+    # New: collate step per sample for GRPO grouping across steps
+    steps = torch.tensor([int(x.get("step", 0)) for x in batch]).long()
+
+    return {
+        "with_privilege": collated_wp,
+        "without_privilege": collated_np,
+        "reward": rewards,
+        "goal": goals,
+        "privileged_found": privileged_found,
+        "trajectory_index": trajectory_index,
+        "step": steps,
+    }
 
 
 def padded_collate_grpo(
@@ -727,20 +862,18 @@ def padded_collate_grpo(
     padding_idx: int = 0,
     ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
 ) -> Dict[str, torch.Tensor]:
-    
-    mini_batch=batch[0]
-    
+
+    mini_batch = batch[0]
 
     return {
-            "query_responses":mini_batch["query_responses"],
-            "logprobs":mini_batch["logprobs"],
-            "ref_logprobs":mini_batch["ref_logprobs"],
-            "advantages":mini_batch["advantages"],
-            "masks":mini_batch["masks"],
-            "position_ids":mini_batch["position_ids"],
-            "response_padding_masks":mini_batch["response_padding_masks"],
-            "query_len":mini_batch["query_len"],
-            "type": mini_batch["type"],
-            "response_tokens": mini_batch["response_tokens"]
-        }
-
+        "query_responses": mini_batch["query_responses"],
+        "logprobs": mini_batch["logprobs"],
+        "ref_logprobs": mini_batch["ref_logprobs"],
+        "advantages": mini_batch["advantages"],
+        "masks": mini_batch["masks"],
+        "position_ids": mini_batch["position_ids"],
+        "response_padding_masks": mini_batch["response_padding_masks"],
+        "query_len": mini_batch["query_len"],
+        "type": mini_batch["type"],
+        "response_tokens": mini_batch["response_tokens"],
+    }
