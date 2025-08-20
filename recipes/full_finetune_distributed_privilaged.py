@@ -146,6 +146,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         super().__init__(cfg=cfg)
         self.to_train_p = cfg.get("train_p", False)
         self.to_train_q = cfg.get("train_q", False)
+        self.to_train_quiet_p = cfg.get("train_quiet_p", 0)
         # Store reference logprobs for importance sampling
         self.reference_logprobs_cache = {}
         self.reference_logprobs_cache_p = {}
@@ -541,6 +542,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
     def compute_rewards(
         self,
+        action_log_ps_as_reward: bool = False,
     ) -> Tuple[
         List[float],
         List[float],
@@ -565,7 +567,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             A tuple containing:
             - A list of rewards for each sample (original + KL penalty).
             - A list of advantages for each sample.
-            - Mean log probability of action tokens without privilege (p_yz_g_x_mean).
+            - Mean log probability of action tokens without privilege (p_y_g_zx_mean).
             - Mean log probability of action tokens with privilege (q_y_g_xz_mean).
             - Mean entropy of thought tokens with privilege (q_z_g_xy_mean).
             - Dictionary of rewards grouped by goal.
@@ -723,9 +725,12 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             )
 
             # Use KL divergence as rewards with gamma weighting
-            rewards = reward + (
-                action_log_prob_without_privilege - self.gamma * kl_divergence
-            )
+            if action_log_ps_as_reward:
+                rewards = action_log_prob_without_privilege 
+            else:
+                rewards = reward + (
+                    action_log_prob_without_privilege - self.gamma * kl_divergence
+                )
             # if action_log_prob_with_privilege != action_log_prob_without_privilege else torch.tensor([-1.0], device=self._device)
 
             # clip rewards
@@ -754,11 +759,6 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             if goal not in rewards_by_goal:
                 rewards_by_goal[goal] = []
             rewards_by_goal[goal].append(reward)
-
-        # Calculate mean reward for each goal (kept for logging/backward compat)
-        mean_rewards_by_goal = {
-            goal: np.mean(rewards) for goal, rewards in rewards_by_goal.items()
-        }
 
         # GRPO: group-relative advantages by (goal, step) aggregating (trajectory_id, reward)
         rewards_by_goal_step: Dict[str, Dict[int, List[Tuple[int, float]]]] = (
@@ -817,7 +817,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 f"Flipped reward range: [{min(all_rewards):.4f}, {max(all_rewards):.4f}]"
             )
 
-        p_yz_g_x_mean = np.mean(p_y_g_zx)
+        p_y_g_xz_mean = np.mean(p_y_g_zx)
         q_y_g_xz_mean = np.mean(q_y_g_xz)
         q_z_g_xy_mean = np.mean(q_z_g_xy)
 
@@ -828,44 +828,46 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         return (
             all_rewards,
             advantages,
-            p_yz_g_x_mean,
+            p_y_g_xz_mean,
             q_y_g_xz_mean,
             q_z_g_xy_mean,
             rewards_by_goal,
             kls,
+            p_y_g_zx,
         )
 
     def train(self) -> None:
-        if self.to_train_q:
+        if self.to_train_quiet_p:
             log.info("=" * 50)
             log.info("=" * 50)
             log.info("=" * 50)
-            log.info("Training Q model")
-            log.info("=" * 50)
-            log.info("=" * 50)
-            log.info("=" * 50)
-            self.train_q()
-
-        if self.to_train_p:
-            log.info("=" * 50)
-            log.info("=" * 50)
-            log.info("=" * 50)
-            log.info("Training P model")
+            log.info("Training P model in quiet mode")
             log.info("=" * 50)
             log.info("=" * 50)
             log.info("=" * 50)
             self.epochs_run = 0
-            self.train_p()
-        # if self.to_train_quiet_p:
-        #     log.info("=" * 50)
-        #     log.info("=" * 50)
-        #     log.info("=" * 50)
-        #     log.info("Training P model in quiet mode")
-        #     log.info("=" * 50)
-        #     log.info("=" * 50)
-        #     log.info("=" * 50)
-        #     self.epochs_run = 0
-        #     self.train_quiet_p()
+            self.train_quiet_p()
+        else:
+            if self.to_train_q:
+                log.info("=" * 50)
+                log.info("=" * 50)
+                log.info("=" * 50)
+                log.info("Training Q model")
+                log.info("=" * 50)
+                log.info("=" * 50)
+                log.info("=" * 50)
+                self.train_q()
+
+            if self.to_train_p:
+                log.info("=" * 50)
+                log.info("=" * 50)
+                log.info("=" * 50)
+                log.info("Training P model")
+                log.info("=" * 50)
+                log.info("=" * 50)
+                log.info("=" * 50)
+                self.epochs_run = 0
+                self.train_p()
 
     def train_p(self) -> None:
         """
@@ -1321,11 +1323,12 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             (
                 all_rewards,
                 all_advantages,
-                p_yz_g_x_mean,
+                p_y_g_zx_mean,
                 q_y_g_xz_mean,
                 q_z_g_xy_mean,
                 rewards_by_goal,
                 kls,
+                p_y_g_zx_all
             ) = self.compute_rewards()
 
             # TODO: This is hacky need a better way to do this but this will work for now
@@ -1559,7 +1562,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                             / (time_per_step * world_size),
                             "q_y_g_xz_mean": q_y_g_xz_mean,
                             "q_z_g_xy_mean": q_z_g_xy_mean,
-                            "p_yz_g_x_mean": p_yz_g_x_mean,
+                            "p_y_g_zx_mean": p_y_g_zx_mean,
                         }
                         # Add gradient norm stats to logging
                         log_dict.update(grad_norm_stats)
@@ -1678,12 +1681,13 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             (
                 all_rewards,
                 all_advantages,
-                p_yz_g_x_mean,
+                p_y_g_zx_mean,
                 q_y_g_xz_mean,
                 q_z_g_xy_mean,
                 rewards_by_goal,
                 kls,
-            ) = self.compute_rewards()
+                p_y_g_zx_all
+            ) = self.compute_rewards(action_log_ps_as_reward=True)
 
             # TODO: This is hacky need a better way to do this but this will work for now
             # I think the issue is that the advantages are
@@ -1779,7 +1783,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
                 # Shape [b, s], needed for the loss not the model
                 labels = train_batch.pop("labels")
-                train_batch.pop("action_start_pos", None)
+                action_start_pos = train_batch.pop("action_start_pos", None)
                 train_batch.pop("action_end_pos", None)
                 train_batch.pop("end_of_prompt", None)
                 train_batch.pop("mask", None)
@@ -1818,8 +1822,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     logits = logits.reshape(-1, logits.size(-1))
 
                 # index for labels of the cot only
-                logits = logits[:action_start_loc]
-                labels = labels[:action_start_loc]
+                logits = logits[:action_start_pos]
+                labels = labels[:action_start_pos]
 
                 combined_loss = self._loss_fn(
                     logits=logits,
@@ -1922,7 +1926,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                             / (time_per_step * world_size),
                             "q_y_g_xz_mean": q_y_g_xz_mean,
                             "q_z_g_xy_mean": q_z_g_xy_mean,
-                            "p_yz_g_x_mean": p_yz_g_x_mean,
+                            "p_y_g_zx_mean": p_y_g_zx_mean,
                         }
                         # Add gradient norm stats to logging
                         log_dict.update(grad_norm_stats)
