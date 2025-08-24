@@ -358,6 +358,7 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
             log_probs = F.log_softmax(logits_chunk, dim=-1)
             vocab_size = log_probs.size(-1)
             valid_indices = labels_chunk.clamp(0, vocab_size - 1)
+            gathered_log_probs = torch.gather(log_probs, dim=-1, index=valid_indices.unsqueeze(-1)).squeeze(-1)
 
             gathered_probs = gathered_log_probs.exp() + self.epsilon
 
