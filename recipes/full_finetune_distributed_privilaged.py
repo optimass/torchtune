@@ -588,6 +588,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         # Also store batch info for matching during training
         self.batch_info_cache = {} if self.use_importance_sampling else None
         batch_idx = 0
+      
 
         # Track trajectory indices and steps for GRPO grouping
         all_trajectory_indices: List[int] = []
@@ -603,8 +604,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             reward = torch.tensor([batch.pop("reward")], device=self._device)
 
             # Extract positions from batch
-            end_of_prompt_with_priv = batch["with_privilege"]["end_of_prompt"]
-            action_start_pos_with_priv = batch["with_privilege"]["action_start_pos"]
+            end_of_prompt_with_priv = batch["with_privilege_target_action"]["end_of_prompt"]
+            action_start_pos_with_priv = batch["with_privilege_target_action"]["action_start_pos"]
             action_end_pos_with_priv = batch["with_privilege"]["action_end_pos"]
             end_of_prompt_without_priv = batch["without_privilege"]["end_of_prompt"]
             action_start_pos_without_priv = batch["without_privilege"][
@@ -625,7 +626,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 all_steps.extend([0] * trajectory_index.shape[0])
 
             # with privilege
-            batch_with_priv = batch["with_privilege"]
+            batch_with_priv = batch["with_privilege_target_action"]
             labels_with_priv = batch_with_priv["labels"]
             model_inputs_with_priv = {
                 k: v
@@ -726,7 +727,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
             # Use KL divergence as rewards with gamma weighting
             if action_log_ps_as_reward:
-                rewards = action_log_prob_without_privilege 
+                rewards = reward + action_log_prob_without_privilege 
             else:
                 rewards = reward + (
                     action_log_prob_without_privilege - self.gamma * kl_divergence
@@ -1009,7 +1010,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 n_samples * n_gpus
             ) % self._gradient_accumulation_steps
 
-            for j, batch in enumerate(self._dataloader):
+            for j, batch in (enumerate(self._dataloader)):
                 if ((idx // self._gradient_accumulation_steps)) >= (
                     self._steps_per_epoch
                 ) and not self.max_bsize:
@@ -1383,7 +1384,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             number_leftover_samples = (
                 n_samples * n_gpus
             ) % self._gradient_accumulation_steps
-            for j, batch in enumerate(self._dataloader):
+            for j, batch in (enumerate(self._dataloader)):
                 if ((idx // self._gradient_accumulation_steps)) >= (
                     self._steps_per_epoch
                 ) and not self.max_bsize:
@@ -1425,7 +1426,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
                 # Shape [b, s], needed for the loss not the model
                 labels = train_batch.pop("labels")
-                train_batch.pop("action_start_pos", None)
+                action_start_pos = train_batch.pop("action_start_pos", None)
                 train_batch.pop("action_end_pos", None)
                 train_batch.pop("end_of_prompt", None)
                 train_batch.pop("mask", None)
@@ -1448,6 +1449,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
                     ref_cached = self.reference_logprobs_cache.get(j)
                     if ref_cached is not None:
+                        n_chunks = len(ref_cached)
+                        # ref_logprobs_for_loss = torch.cat(ref_cached,dim=1)[:,:action_start_pos].chunk(n_chunks, dim=1)
                         ref_logprobs_for_loss = ref_cached
                 processed_samples += batch_size
                 with self.activations_handling_ctx:
@@ -1460,7 +1463,12 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 if not isinstance(logits, list):
                     labels = labels.reshape(-1)
                     logits = logits.reshape(-1, logits.size(-1))
-
+                
+                
+                # logits = index_chunkced(logits,  action_start_pos)
+                # labels = labels[:, :action_start_pos]
+                
+                
                 combined_loss = self._loss_fn(
                     logits=logits,
                     labels=labels,
@@ -1669,6 +1677,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     for _, batch in enumerate(dataloader_validation):
                         batch.pop("goal", None)
                         batch.pop("privileged_found", None)
+
                         utils.batch_to_device(batch, self._device)
                         val_loss = torch.tensor(0.0, device=self._device)
                         if self._is_rank_zero:
@@ -1787,7 +1796,6 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 train_batch.pop("action_end_pos", None)
                 train_batch.pop("end_of_prompt", None)
                 train_batch.pop("mask", None)
-
                 batch_size = labels.shape[0]
                 advantages = all_advantages[j]
                 advantages = torch.tensor(advantages, device=self._device)
@@ -1807,6 +1815,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
                     ref_cached = self.reference_logprobs_cache.get(j)
                     if ref_cached is not None:
+                        n_chunks = len(ref_cached)
+                        # ref_logprobs_for_loss = torch.cat(ref_cached,dim=1)[:,:action_start_pos].chunk(n_chunks, dim=1)
                         ref_logprobs_for_loss = ref_cached
                 processed_samples += batch_size
 
@@ -1822,8 +1832,9 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     logits = logits.reshape(-1, logits.size(-1))
 
                 # index for labels of the cot only
-                logits = logits[:action_start_pos]
-                labels = labels[:action_start_pos]
+                
+                # logits = index_chunkced(logits,  action_start_pos)
+                # labels = labels[:, :action_start_pos]
 
                 combined_loss = self._loss_fn(
                     logits=logits,
@@ -1982,6 +1993,24 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
         self._profiler.stop()
 
+def index_chunkced(chunked, index):
+    """Concatenate chunked [B, T_i, D] tensors, slice up to index along seq dim, then re-chunk.
+
+    Args:
+        chunked: List of tensors shaped [B, T_i, D] with consistent B and D.
+        index:   Integer sequence cut-off; keep tokens in [0, index) along seq dim.
+
+    Returns:
+        List[Tensor]: Re-chunked tensors up to the provided index, preserving original
+        chunk sizes where possible (last chunk may be truncated). If index <= 0, returns [].
+    """
+    # Concatenate along sequence dimension [B, S_total, D]
+    num_chunks = len(chunked)
+    unchunked = torch.cat(chunked, dim=1)
+    unchunked = unchunked[...,:index, :]
+    rechunked = unchunked.chunk(num_chunks, dim=1)
+
+    return rechunked
 
 @config.parse
 def recipe_main(cfg: DictConfig) -> None:

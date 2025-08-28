@@ -42,31 +42,52 @@ class priv_dataloader(Dataset):
         sample = self._data[index]
         return self._prepare_sample(sample)
 
+    def _maybe_replace_action(self, output: str, sample: Mapping[str, Any]) -> str:
+        """
+        If match_reward is -1, replace the content of the last <action>...</action>
+        block in the output with the expected action, preserving the tags.
+        Assumes required keys exist in the sample.
+        """
+        match_reward = sample["match_reward"]
+        expected_action = sample["expected_action"]
+        if match_reward != -1:
+            return output
+
+        # Find the last <action>...</action> block
+        action_matches = list(
+            re.finditer(r"<action>.*?</action>", output, flags=re.DOTALL)
+        )
+        if not action_matches:
+            return output
+
+        start, end = action_matches[-1].span()
+        replacement = f"<action>{expected_action}</action>"
+        return output[:start] + replacement + output[end:]
+
     def _prepare_sample(self, sample: Mapping[str, Any]) -> Dict[str, Any]:
         prompt = sample["prompt"]
         output = sample["output"]
 
+        # If match_reward is -1, replace the last action with the expected_action
+        output_goal_action = self._maybe_replace_action(output, sample)
+
         # Detect if privileged information tags are present
-        secret_pattern = r"<Secret information>.*?</Secret information>"
-        privileged_found = (
-            1 if re.search(secret_pattern, prompt, flags=re.DOTALL) else 0
-        )
-
-        # Remove secret information from the prompt
-        prompt_no_secret = re.sub(secret_pattern, "", prompt, flags=re.DOTALL).strip()
-
-        # Extract the last <action>...</action> block from the output, inclusive of tags
-        action_blocks = list(
+        def _extract_parts(prompt: str, output: str):
+            secret_pattern = r"<Secret information>.*?</Secret information>"
+            privileged_found = 1 if re.search(secret_pattern, prompt, flags=re.DOTALL) else 0
+            prompt_no_secret = re.sub(secret_pattern, "", prompt, flags=re.DOTALL).strip()
+            action_blocks = list(
             re.finditer(r"<action>.*?</action>", output, flags=re.DOTALL)
-        )
-
-        # Get character positions of action block in original output
-        action_start_char, action_end_char = (
+            )
+            action_start_char, action_end_char = (
             action_blocks[-1].span() if action_blocks else (0, 0)
-        )
+            )
+            before_action = output[:action_start_char]
+            return prompt, prompt_no_secret, output, action_start_char, before_action, privileged_found
 
-        # Split output into parts: before_action + action + after_action
-        before_action = output[:action_start_char]
+        prompt, prompt_no_secret, output, action_start_char, before_action, privileged_found = _extract_parts(
+            prompt, output
+        )
 
         # Scenario 1: p(output | prompt_with_secret)
         with_privilege = self._process_scenario(prompt, output, before_action)
@@ -75,6 +96,13 @@ class priv_dataloader(Dataset):
         without_privilege = self._process_scenario(
             prompt_no_secret, output, before_action
         )
+        
+        prompt_target_action, _, output_target_action, _, before_action_target_action, _  \
+            = _extract_parts(prompt,output_goal_action)
+        
+        with_privilege_target_action = self._process_scenario(prompt_target_action, output_target_action, before_action_target_action)
+
+
 
         return {
             "with_privilege": with_privilege,
@@ -83,8 +111,10 @@ class priv_dataloader(Dataset):
             "og_reward": sample["og_reward"],
             "goal": sample.get("trajectory_key", ""),
             "privileged_found": privileged_found,
-            'trajectory_index' : sample.get('trajectory_index', 0),
+            "trajectory_index": sample.get("trajectory_index", 0),
             "step": sample.get("step_id", 0),
+            "with_privilege_target_action": with_privilege_target_action,
+            # "expected_action": sample.get("expected_action", ""),
         }
 
     def _encode_with_role(

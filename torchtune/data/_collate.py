@@ -729,6 +729,7 @@ def padded_collate_privilege(
     This function takes a batch of samples from `priv_dataloader` and collates them
     into padded tensors for both 'with_privilege' and 'without_privilege' scenarios.
     """
+
     # Collate 'with_privilege' data
     tokens_wp = [torch.tensor(x["with_privilege"]["tokens"]) for x in batch]
     labels_wp = [torch.tensor(x["with_privilege"]["labels"]) for x in batch]
@@ -781,6 +782,68 @@ def padded_collate_privilege(
         "action_end_pos": action_end_pos_wp,
         "end_of_prompt": end_of_prompt_wp,
     }
+
+    # Collate 'with_privilege_target_action' if present in batch
+    if "with_privilege_target_action" in batch[0]:
+        tokens_wpta = [
+            torch.tensor(x["with_privilege_target_action"]["tokens"]) for x in batch
+        ]
+        labels_wpta = [
+            torch.tensor(x["with_privilege_target_action"]["labels"]) for x in batch
+        ]
+        padded_tokens_wpta = pad_sequence(
+            tokens_wpta, batch_first=True, padding_value=padding_idx
+        )
+        padded_labels_wpta = pad_sequence(
+            labels_wpta, batch_first=True, padding_value=ignore_idx
+        )
+
+        len_tokens_wpta = padded_tokens_wpta.shape[-1]
+        len_labels_wpta = padded_labels_wpta.shape[-1]
+        if len_tokens_wpta > len_labels_wpta:
+            padded_labels_wpta = F.pad(
+                padded_labels_wpta,
+                (0, len_tokens_wpta - len_labels_wpta),
+                value=ignore_idx,
+            )
+        elif len_labels_wpta > len_tokens_wpta:
+            padded_tokens_wpta = F.pad(
+                padded_tokens_wpta,
+                (0, len_labels_wpta - len_tokens_wpta),
+                value=padding_idx,
+            )
+
+        masks_wpta = [x["with_privilege_target_action"]["mask"] for x in batch]
+        action_start_pos_wpta = torch.tensor(
+            [x["with_privilege_target_action"]["action_start_pos"] for x in batch]
+        )
+        action_end_pos_wpta = torch.tensor(
+            [x["with_privilege_target_action"]["action_end_pos"] for x in batch]
+        )
+        end_of_prompt_wpta = torch.tensor(
+            [x["with_privilege_target_action"]["end_of_prompt"] for x in batch]
+        )
+
+        padded_masks_wpta = []
+        for mask in masks_wpta:
+            mask_tensor = torch.tensor(mask, dtype=torch.bool)
+            if len(mask_tensor) < len_tokens_wpta:
+                mask_tensor = F.pad(
+                    mask_tensor, (0, len_tokens_wpta - len(mask_tensor)), value=True
+                )
+            padded_masks_wpta.append(mask_tensor)
+        padded_masks_wpta = torch.stack(padded_masks_wpta)
+
+        collated_wpta = {
+            "tokens": padded_tokens_wpta.long(),
+            "labels": padded_labels_wpta.long(),
+            "mask": padded_masks_wpta,
+            "action_start_pos": action_start_pos_wpta,
+            "action_end_pos": action_end_pos_wpta,
+            "end_of_prompt": end_of_prompt_wpta,
+        }
+    else:
+        collated_wpta = None
 
     # Collate 'without_privilege' data
     tokens_np = [torch.tensor(x["without_privilege"]["tokens"]) for x in batch]
@@ -845,8 +908,8 @@ def padded_collate_privilege(
     ).long()
     # New: collate step per sample for GRPO grouping across steps
     steps = torch.tensor([int(x.get("step", 0)) for x in batch]).long()
-
-    return {
+    # expected_actions = [x.get("expected_actions", []) for x in batch]
+    out = {
         "with_privilege": collated_wp,
         "without_privilege": collated_np,
         "reward": rewards,
@@ -854,7 +917,11 @@ def padded_collate_privilege(
         "privileged_found": privileged_found,
         "trajectory_index": trajectory_index,
         "step": steps,
+        # "expected_actions": expected_actions,
     }
+    if collated_wpta is not None:
+        out["with_privilege_target_action"] = collated_wpta
+    return out
 
 
 def padded_collate_grpo(
