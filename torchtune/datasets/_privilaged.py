@@ -98,9 +98,9 @@ class priv_dataloader(Dataset):
         )
         
         prompt_target_action, _, output_target_action, _, before_action_target_action, _  \
-            = _extract_parts(prompt,output_goal_action)
+            = _extract_parts(prompt_no_secret,output_goal_action)
         
-        with_privilege_target_action = self._process_scenario(prompt_target_action, output_target_action, before_action_target_action)
+        without_privilege_target_action = self._process_scenario(prompt_target_action, output_target_action, before_action_target_action)
 
 
 
@@ -113,7 +113,7 @@ class priv_dataloader(Dataset):
             "privileged_found": privileged_found,
             "trajectory_index": sample.get("trajectory_index", 0),
             "step": sample.get("step_id", 0),
-            "with_privilege_target_action": with_privilege_target_action,
+            "without_privilege_target_action": without_privilege_target_action,
             # "expected_action": sample.get("expected_action", ""),
         }
 

@@ -604,14 +604,18 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             reward = torch.tensor([batch.pop("reward")], device=self._device)
 
             # Extract positions from batch
-            end_of_prompt_with_priv = batch["with_privilege_target_action"]["end_of_prompt"]
-            action_start_pos_with_priv = batch["with_privilege_target_action"]["action_start_pos"]
+            end_of_prompt_with_priv = batch["with_privilege"]["end_of_prompt"]
+            action_start_pos_with_priv = batch["with_privilege"]["action_start_pos"]
             action_end_pos_with_priv = batch["with_privilege"]["action_end_pos"]
-            end_of_prompt_without_priv = batch["without_privilege"]["end_of_prompt"]
-            action_start_pos_without_priv = batch["without_privilege"][
+
+
+            end_of_prompt_without_priv = batch["without_privilege_target_action"]["end_of_prompt"]
+            action_start_pos_without_priv = batch["without_privilege_target_action"][
                 "action_start_pos"
             ]
-            action_end_pos_without_priv = batch["without_privilege"]["action_end_pos"]
+            action_end_pos_without_priv = batch["without_privilege_target_action"]["action_end_pos"]
+
+            
             trajectory_index = batch["trajectory_index"]
             step_ids = batch.get("step", None)
 
@@ -626,7 +630,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 all_steps.extend([0] * trajectory_index.shape[0])
 
             # with privilege
-            batch_with_priv = batch["with_privilege_target_action"]
+            batch_with_priv = batch["with_privilege"]
             labels_with_priv = batch_with_priv["labels"]
             model_inputs_with_priv = {
                 k: v
@@ -647,7 +651,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 ]
 
             # without privilege
-            batch_without_priv = batch["without_privilege"]
+            batch_without_priv = batch["without_privilege_target_action"]
             labels_without_priv = batch_without_priv["labels"]
             model_inputs_without_priv = {
                 k: v
@@ -1107,6 +1111,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     combined_loss = self._loss_fn(
                         logits=loss_logits, labels=labels_shifted
                     )
+                if use_rl: 
+                    log.info(f"Using RL loss at idx {idx} for sample {j}")
 
                 running_loss += combined_loss.detach()
                 # For optimizer in backward, we need to normalize before calling backward
