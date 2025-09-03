@@ -24,7 +24,9 @@ from torchtune._recipe_registry import Config, get_all_recipes, Recipe
 try:
     ROOT = Path(torchtune.__file__).parent.parent
 except:
-    ROOT = "/home/toolkit/ui-copilot/finetuning/torchtune"
+    ROOT = Path("/home/toolkit/ui-copilot/finetuning/torchtune")
+    if not ROOT.exists():
+        raise ValueError(f"ROOT path {ROOT} does not exist.")
 
 
 class Run(Subcommand):
