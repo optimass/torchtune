@@ -4,17 +4,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-
+import contextlib
 import logging
+from copy import deepcopy
 import os
 from itertools import chain
-from typing import Any, Callable, cast, Dict, List, Optional, Tuple
+from typing import Any, Callable, cast, Generator, Optional, Union
+
+from functools import cached_property
+from dataclasses import dataclass
+from torch.nn.modules.module import _IncompatibleKeys
+
 
 import torch
 import torch.distributed as dist
 from torch import nn
-
+from torch.distributed.fsdp import FSDPModule, ShardingStrategy
 from torch.distributed._composable.fsdp import CPUOffloadPolicy, fully_shard
+from torch.distributed.tensor.experimental import context_parallel
+from torch.distributed.tensor.experimental._attention import set_rotate_method
+from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.nn.attention.flex_attention import BlockMask
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed._tensor import distribute_tensor, DTensor
 from torch.distributed._tensor.placement_types import DTensorSpec, TensorMeta
 from torch.distributed.checkpoint.state_dict import _init_optim_state
@@ -23,13 +34,143 @@ from torch.optim import Optimizer
 from torchao.dtypes.nf4tensor import NF4Tensor, to_nf4
 from torchtune.modules import TransformerDecoder
 from torchtune.utils import get_logger
+from torchtune.modules.attention import MultiHeadAttention
+from torchtune.modules.model_fusion import DeepFusionModel, EarlyFusionModel
+from torch.distributed.checkpoint.state_dict import (
+    _init_optim_state,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+    StateDictOptions,
+)
 
 from torchtune.utils._device import get_device
 
 _log: logging.Logger = get_logger()
 
+_DISTRIBUTED_STATE_DICT_API_IS_AVAILABLE = False
+
 
 _valid_distributed_single_node_nnodes = ["1:1", "1"]
+
+
+
+@dataclass
+class ParallelDims:
+    dp_replicate: int
+    dp_shard: int
+    tp: int
+    cp: int
+    world_size: int
+
+    def __post_init__(self):
+        self._validate()
+
+    def _validate(self):
+        dp_replicate, dp_shard, tp, cp = (
+            self.dp_replicate,
+            self.dp_shard,
+            self.tp,
+            self.cp,
+        )
+        for d in (dp_replicate, tp, cp):
+            assert d >= 1, "Parallelism degree should be >= 1, except for dp_shard"
+
+        assert dp_shard == -1 or dp_shard >= 1, " dp_shard must -1 or >=1."
+        if dp_shard < 0:
+            self.dp_shard = dp_shard = self.world_size // (dp_replicate * tp * cp)
+        assert dp_shard >= 1
+
+        assert dp_replicate * dp_shard * tp * cp == self.world_size, (
+            f"Invalid parallel dims: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
+            f"tp({tp}) != WORLD_SIZE({self.world_size})"
+        )
+
+    def build_mesh(self, device_type):
+        dims = []
+        names = []
+        for d, name in zip(
+            [self.dp_replicate, self.dp_shard, self.cp, self.tp],
+            ["dp_replicate", "dp_shard", "cp", "tp"],
+        ):
+            if d > 1:
+                dims.append(d)
+                names.append(name)
+
+        names = tuple(names)
+        mesh = init_device_mesh(device_type, dims, mesh_dim_names=names)
+
+        # Create all the submesh here to ensure all required process groups are
+        # initialized:
+        # Mesh for data loading (no communication on this mesh)
+        dp_mesh_dim_names = []
+        dp_shard_cp_mesh_dim_names = []
+        dp_cp_mesh_dim_names = []
+
+        if self.dp_replicate_enabled:
+            dp_mesh_dim_names.append("dp_replicate")
+            dp_cp_mesh_dim_names.append("dp_replicate")
+        if self.dp_shard_enabled:
+            dp_mesh_dim_names.append("dp_shard")
+            dp_shard_cp_mesh_dim_names.append("dp_shard")
+            dp_cp_mesh_dim_names.append("dp_shard")
+        if self.cp_enabled:
+            dp_shard_cp_mesh_dim_names.append("cp")
+            dp_cp_mesh_dim_names.append("cp")
+
+        if dp_mesh_dim_names != []:
+            mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+
+        if dp_shard_cp_mesh_dim_names != []:
+            mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(
+                mesh_dim_name="dp_shard_cp"
+            )
+        if dp_cp_mesh_dim_names != []:
+            mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
+
+        return mesh
+
+    @property
+    def cp_enabled(self):
+        return self.cp > 1
+
+    @property
+    def dp_enabled(self):
+        return self.dp_replicate > 1 or self.dp_shard > 1
+
+    @property
+    def dp_replicate_enabled(self):
+        return self.dp_replicate > 1
+
+    @property
+    def dp_shard_enabled(self):
+        return self.dp_shard > 1
+
+    @property
+    def tp_enabled(self):
+        return self.tp > 1
+
+    @cached_property
+    def non_data_parallel_size(self):
+        # update below as more parallelism options are implemented
+        return self.tp * self.cp
+
+    @cached_property
+    def min_seq_len_divisor(self):
+        """
+        This property can be used for padding batches to a sequence length that is valid for
+        the given ParallelDims.
+
+        Sequence parallelism requires that seq_len be divisible by TP dim.
+        Ref: https://github.com/pytorch/torchtitan/pull/640#discussion_r1849481001
+
+        Context parallelism requires that seq_len be divisible by 2 * CP dim.
+        Ref: https://github.com/pytorch/pytorch/blob/4f62dcc/torch/distributed/tensor/experimental/_attention.py#L1246
+
+        """
+        if self.cp > 1:
+            return 2 * self.tp * self.cp
+        return self.tp
 
 
 def _get_sharding_strategy(strategy: str) -> ShardingStrategy:
@@ -109,11 +250,11 @@ def get_distributed_backend(device_type: str, offload_ops_to_cpu: bool = False) 
 
 
 
-def init_distributed(**kwargs: Dict[str, Any]) -> bool:
+def init_distributed(**kwargs: dict[str, Any]) -> bool:
     """Initialize process group required for ``torch.distributed``.
 
     Args:
-        **kwargs (Dict[str, Any]): Additional arguments to pass to torch.distributed.init_process_group.
+        **kwargs (dict[str, Any]): Additional arguments to pass to torch.distributed.init_process_group.
 
     Returns:
         bool: True if torch.distributed is initialized.
@@ -146,7 +287,7 @@ def set_torch_num_threads() -> None:
     _log.info(f"Set intra op parallelism no. of threads to {num_threads}")
 
 
-def get_world_size_and_rank() -> Tuple[int, int]:
+def get_world_size_and_rank() -> tuple[int, int]:
     """Function that gets the current world size (aka total number
     of ranks) and rank number of the current process in the default process group.
 
@@ -178,78 +319,128 @@ def validate_no_params_on_meta_device(model: nn.Module) -> None:
 
 def load_from_full_model_state_dict(
     model: "FSDPModule",  # noqa
-    full_sd: Dict[str, Any],
+    full_sd: dict[str, Any],
     device: torch.device,
-    is_rank_zero: bool,
     strict: bool = False,
     cpu_offload: bool = False,
-):
+    use_distributed_state_dict: bool = False,
+    release_sd: bool = True,
+) -> _IncompatibleKeys:
     """
     Converting full state dict into a sharded state dict
     and loading it into FSDP model
-    - 'full' means plain tensor
-    - 'sharded' means `DTensor` where reach rank has a shard of the plain tensor
-    - `is_rank_zero` matters if only rank 0 pass in non-empty `full_sd` and
-       we need to broadcast from rank 0
+    Args:
+        model (FSDPModule): Model to generate fully qualified names for cpu_state_dict
+        full_sd (dict[str, Any]): a full state dict to load into the model
+        device (torch.device): device used to move full state dict tensors
+        strict (bool): flag to check if to load the model in strict mode
+        cpu_offload (bool): flag to check if offload to CPU is enabled
+        use_distributed_state_dict (bool): Whether to use set_model_state_dict for loading
+            state dict. Default: False. (TODO: this should be True once 3.2 Vision is fixed)
+        release_sd (bool): whether to release memory of full_sd to save ram usage
+    Returns:
+        ``NamedTuple`` with ``missing_keys`` and ``unexpected_keys`` fields:
+            * **missing_keys** is a list of str containing the missing keys
+            * **unexpected_keys** is a list of str containing the unexpected keys
+
+    Raises:
+        NotImplementedError: If got FSDP with more than 1D.
     """
+    # PyTorch nightly versions from December 20, 2024, support the following features:
+    # - `set_model_state_dict` with the `cpu_offload` option
+    # - Multiple devices in local state dict
+    # - Relative optimizations for improved memory performance
+    # Please keep the version check `_DISTRIBUTED_STATE_DICT_API_IS_AVAILABLE` until these changes are
+    # released in the PyTorch stable version.
+    has_nf4 = any(
+        hasattr(param, "_local_tensor") and isinstance(param._local_tensor, NF4Tensor)
+        for param in model.parameters()
+    )
     meta_sharded_sd = model.state_dict()
-    sharded_sd = {}
-    for param_name, full_tensor in full_sd.items():
-        sharded_meta_param = meta_sharded_sd.get(param_name)
-        full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
-        if hasattr(sharded_meta_param, "_local_tensor") and isinstance(
-            sharded_meta_param._local_tensor, NF4Tensor
-        ):
-            block_size = sharded_meta_param._local_tensor.block_size
-            scaler_block_size = sharded_meta_param._local_tensor.scaler_block_size
-            full_tensor = to_nf4(
-                full_tensor, block_size=block_size, scaler_block_size=scaler_block_size
-            )
-            # replicating logic from `_fsdp_param.py`` `_init_sharded_param`
-            # otherwise `distribute_tensor(DTensor(local=NF4))`
-            # requires dispatching `c10d.scatter_``
-            # long-term solution is `swap_tensor`
-            mesh = sharded_meta_param.device_mesh
-            if mesh.ndim > 1:
-                raise NotImplementedError(f"only support 1D FSDP but got {mesh.ndim=}")
-            shard_mesh_dim = 0
-            shard_world_size = mesh.size(shard_mesh_dim)
-            shard_rank = cast(
-                torch.distributed.ProcessGroup, mesh.get_group(shard_mesh_dim)
-            ).rank()
-            chunk = list(torch.chunk(full_tensor, shard_world_size, dim=0))[shard_rank]
-            sharded_param = full_tensor.new_zeros(chunk.size())
-            sharded_param[: chunk.size(0)].copy_(chunk)
+    # NF4Tensor is not supported in `set_model_state_dict` right now, running with the previous logic right
+    # now, would support in the future and remove the following code
+    if (
+        _DISTRIBUTED_STATE_DICT_API_IS_AVAILABLE and not has_nf4
+    ) or use_distributed_state_dict:
+        for param_name in full_sd.keys():
+            sharded_meta_param = meta_sharded_sd.get(param_name)
+            full_sd[param_name] = full_sd[param_name].to(sharded_meta_param.dtype)
+        options = StateDictOptions(
+            full_state_dict=True,
+            broadcast_from_rank0=True,
+            strict=strict,
+            cpu_offload=cpu_offload,
+        )
+        return set_model_state_dict(
+            model=model, model_state_dict=full_sd, options=options
+        )
+    else:
+        sharded_sd = {}
+        for param_name, full_tensor in full_sd.items():
+            sharded_meta_param = meta_sharded_sd.get(param_name)
+            assert sharded_meta_param is not None, f"{param_name} not found in model"
+            full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
+            if hasattr(sharded_meta_param, "_local_tensor") and isinstance(
+                sharded_meta_param._local_tensor, NF4Tensor
+            ):
+                block_size = sharded_meta_param._local_tensor.block_size
+                scaler_block_size = sharded_meta_param._local_tensor.scaler_block_size
+                full_tensor = to_nf4(
+                    full_tensor,
+                    block_size=block_size,
+                    scaler_block_size=scaler_block_size,
+                )
+                # replicating logic from `_fsdp_param.py`` `_init_sharded_param`
+                # otherwise `distribute_tensor(DTensor(local=NF4))`
+                # requires dispatching `c10d.scatter_``
+                # long-term solution is `swap_tensor`
+                mesh = sharded_meta_param.device_mesh
+                if mesh.ndim > 1:
+                    raise NotImplementedError(
+                        f"only support 1D FSDP but got {mesh.ndim}"
+                    )
+                shard_mesh_dim = 0
+                shard_world_size = mesh.size(shard_mesh_dim)
+                shard_rank = cast(
+                    torch.distributed.ProcessGroup, mesh.get_group(shard_mesh_dim)
+                ).rank()
+                chunk = list(torch.chunk(full_tensor, shard_world_size, dim=0))[
+                    shard_rank
+                ]
+                sharded_param = full_tensor.new_zeros(chunk.size())
+                sharded_param[: chunk.size(0)].copy_(chunk)
 
-            # TODO: change to from_local API (need to add view support for NF4)
-            sharded_tensor = DTensor(
-                local_tensor=sharded_param,
-                spec=DTensorSpec(
-                    mesh=sharded_meta_param.device_mesh,
-                    placements=sharded_meta_param.placements,
-                    tensor_meta=TensorMeta(
-                        shape=sharded_meta_param.size(),
-                        dtype=sharded_meta_param.dtype,
-                        stride=sharded_meta_param.stride(),
+                # TODO: change to from_local API (need to add view support for NF4)
+                sharded_tensor = DTensor(
+                    local_tensor=sharded_param,
+                    spec=DTensorSpec(
+                        mesh=sharded_meta_param.device_mesh,
+                        placements=sharded_meta_param.placements,
+                        tensor_meta=TensorMeta(
+                            shape=sharded_meta_param.size(),
+                            dtype=sharded_meta_param.dtype,
+                            stride=sharded_meta_param.stride(),
+                        ),
                     ),
-                ),
-                requires_grad=sharded_meta_param.requires_grad,
-            )
+                    requires_grad=sharded_meta_param.requires_grad,
+                )
 
-        elif not hasattr(sharded_meta_param, "device_mesh"):
-            # In cases where parts of the model aren't sharded, some parameters will be plain tensors
-            sharded_tensor = full_tensor
-        else:
-            sharded_tensor = distribute_tensor(
-                full_tensor,
-                sharded_meta_param.device_mesh,
-                sharded_meta_param.placements,
-            )
-        if cpu_offload:
-            sharded_tensor = sharded_tensor.cpu()
-        sharded_sd[param_name] = nn.Parameter(sharded_tensor)
-    # choose `assign=True` since we cannot call `copy_` on meta tensor
-    return model.load_state_dict(sharded_sd, strict=strict, assign=True)
+            elif not hasattr(sharded_meta_param, "device_mesh"):
+                # In cases where parts of the model aren't sharded, some parameters will be plain tensors
+                sharded_tensor = full_tensor
+            else:
+                sharded_tensor = distribute_tensor(
+                    full_tensor,
+                    sharded_meta_param.device_mesh,
+                    sharded_meta_param.placements,
+                )
+            if cpu_offload:
+                sharded_tensor = sharded_tensor.cpu()
+            sharded_sd[param_name] = nn.Parameter(sharded_tensor)
+            if release_sd:
+                full_sd[param_name] = None
+        # choose `assign=True` since we cannot call `copy_` on meta tensor
+        return model.load_state_dict(sharded_sd, strict=strict, assign=True)
 
 
 def _gather_nf4_tensor(sharded_param: nn.Parameter) -> nn.Parameter:
@@ -277,21 +468,21 @@ def _gather_nf4_tensor(sharded_param: nn.Parameter) -> nn.Parameter:
 
 
 def gather_cpu_state_dict(
-    sharded_sd: Dict[str, DTensor],  # noqa
+    sharded_sd: dict[str, DTensor],  # noqa
     is_rank_zero: bool,
     device: Optional[torch.device] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Converting sharded state dict into a full state dict on CPU
     Returning non-empty result only on rank0 to avoid peaking CPU memory
 
     Args:
-        sharded_sd (Dict[str, DTensor]): Sharded state dict of DTensors
+        sharded_sd (dict[str, DTensor]): Sharded state dict of DTensors
         is_rank_zero (bool): flag to check if the process is on rank 0
         device (Optional[torch.device]): device to use for sharded tensors. Default: None
 
     Returns:
-        Dict[str, Any]: State dict on CPU
+        dict[str, Any]: State dict on CPU
     """
     cpu_state_dict = {}
     for param_name, param in sharded_sd.items():
@@ -317,7 +508,7 @@ def get_full_optimizer_state_dict(
     opt: Optimizer,
     is_rank_zero: bool,
     device: Optional[torch.device] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Converting optimizer state from sharded to full
     For example, "exp_avg" in AdamW is `DTensor`,
@@ -364,9 +555,9 @@ def get_full_optimizer_state_dict(
 
 def load_from_full_optimizer_state_dict(
     opt: Optimizer,
-    full_sd: Dict[str, Any],
+    full_sd: dict[str, Any],
     device: torch.device,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Converting full optimizer state to sharded state dict
     and loading it into optimizer
@@ -412,7 +603,7 @@ def load_from_full_optimizer_state_dict(
 def get_shard_conditions(
     name: str,
     module: nn.Module,
-    names_to_match: Optional[List[str]] = None,
+    names_to_match: Optional[list[str]] = None,
     *args,
     **kwargs,
 ) -> bool:
@@ -460,10 +651,11 @@ def get_shard_conditions(
 
 def shard_model(
     model: TransformerDecoder,
-    shard_conditions: List[Callable[[str, nn.Module], bool]],
+    shard_conditions: list[Callable[[str, nn.Module], bool]],
     *,
     cpu_offload: bool,
     reshard_after_forward: bool = True,
+    dp_mesh: Optional[DeviceMesh] = None,
 ) -> None:
     """
     Utility to shard a model with FSDP using the PyTorch Distributed fully_shard API.
@@ -473,7 +665,7 @@ def shard_model(
 
     Args:
         model (TransformerDecoder): Model to shard with FSDP.
-        shard_conditions (List[Callable[[str, nn.Module], bool]]): A list of functions to determine
+        shard_conditions (list[Callable[[str, nn.Module], bool]]): A list of functions to determine
             which modules to shard with FSDP. Each function should take module name (relative to root)
             and the module itself, returning True if FSDP should shard the module and False otherwise.
             If any of shard_conditions return True for a given module, it will be sharded by FSDP.
@@ -482,11 +674,13 @@ def shard_model(
         reshard_after_forward (bool): Whether to reshard parameters and buffers after
             the forward pass. Setting this to True corresponds to the FULL_SHARD sharding strategy
             from FSDP1, while setting it to False corresponds to the SHARD_GRAD_OP sharding strategy.
+        dp_mesh (Optional[DeviceMesh]): Device mesh to use for FSDP sharding under mutliple parallelism.
+            Default to None.
 
     Raises:
         ValueError: If no layer modules were sharded, indicating that no shard_condition was triggered.
     """
-    fsdp_kwargs = {"reshard_after_forward": reshard_after_forward}
+    fsdp_kwargs = {"reshard_after_forward": reshard_after_forward, "mesh": dp_mesh}
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
 
@@ -504,4 +698,196 @@ def shard_model(
         )
 
     # Finally shard the entire model to account for any stragglers
-    fully_shard(model, **fsdp_kwargs)
+    root_kwargs = deepcopy(fsdp_kwargs)
+    root_kwargs["reshard_after_forward"] = False
+    # TODO: we should actually use reshard_after_forward=None
+    # on latest nightlies: https://github.com/pytorch/pytorch/pull/155319
+    fully_shard(model, **root_kwargs)
+
+
+def prepare_mha_for_tp(
+    model: nn.Module,
+    tp_mesh: DeviceMesh,
+) -> nn.Module:
+    """
+    Utility to scale MultiHeadAttention parameters(num_heads, num_kv_heads, embed_dim) across
+    tensor parallel devices. Each device will handle a portion of the attention computations.
+
+    Args:
+        model (nn.Module): Model whose attention parameters will be scaled by TP size.
+        tp_mesh (DeviceMesh): Tensor parallel device mesh.
+
+    Returns:
+        nn.Module: The model with scaled MultiHeadAttention parameters.
+
+    Raises:
+        ValueError: If attention heads, kv heads, or embed dimension is not divisible by TP size.
+
+    Examples:
+        >>> from torchtune.modules import TransformerDecoder
+        >>> from torch.distributed.device_mesh import DeviceMesh
+        >>> model = TransformerDecoder(
+                num_heads=32,
+                num_kv_heads=32,
+                embed_dim=4096,
+            )
+        >>> tp_mesh = DeviceMesh("cuda", torch.arange(2))  # 2 GPUs
+        >>> model = prepare_mha_for_tp(model, tp_mesh)
+        >>> # Now each GPU has:
+        >>> # num_heads = 16 (32/2)
+        >>> # num_kv_heads = 16 (32/2)
+        >>> # embed_dim = 2048 (4096/2)
+    """
+    # Handle fusion models by extracting decoder
+    is_fusion_model = isinstance(model, (DeepFusionModel, EarlyFusionModel))
+    decoder = model.decoder if is_fusion_model else model
+    tp_size = tp_mesh.size()
+    for m in list(decoder.modules()):
+        if isinstance(m, MultiHeadAttention):
+            # Adjust attention module to use the local number of heads
+            if m.num_heads % tp_size != 0:
+                raise ValueError(
+                    f"Number of attention heads ({m.num_heads}) must be divisible by "
+                    f"tensor parallel size ({tp_size})."
+                )
+            if m.num_kv_heads % tp_size != 0:
+                raise ValueError(
+                    f"Number of KV heads ({m.num_kv_heads}) must be divisible by "
+                    f"tensor parallel size ({tp_size})."
+                )
+            if m.embed_dim % tp_size != 0:
+                raise ValueError(
+                    f"Embedding dimension ({m.embed_dim}) must be divisible by "
+                    f"tensor parallel size ({tp_size})."
+                )
+            m.num_heads = m.num_heads // tp_size
+            m.num_kv_heads = m.num_kv_heads // tp_size
+            m.embed_dim = m.embed_dim // tp_size
+
+    if is_fusion_model:
+        model.decoder = decoder
+    return model
+
+
+def _get_sdpa_context() -> (
+    Callable[[Optional[Generator[None, None, None]]], Generator[None, None, None]]
+):
+    """
+    Creates a context manager to confine to flash/efficient/cuDNN attention backends.
+
+    Returns:
+        A context manager function that takes an optional context parallel context.
+    """
+
+    @contextlib.contextmanager
+    def context(cp_context: Union[Generator[None, None, None], None] = None):
+        with contextlib.ExitStack() as stack:
+            if cp_context is not None:
+                stack.enter_context(
+                    sdpa_kernel(
+                        [
+                            SDPBackend.FLASH_ATTENTION,
+                            SDPBackend.EFFICIENT_ATTENTION,
+                            SDPBackend.CUDNN_ATTENTION,
+                        ]
+                    )
+                )
+                stack.enter_context(cp_context)
+
+            yield
+
+    return context
+
+
+def get_context_parallel_manager(
+    *,
+    enabled: bool = False,
+    rotate_method: str = "allgather",
+    world_mesh: torch.distributed.DeviceMesh,
+    model: TransformerDecoder,
+) -> Callable[[list[torch.Tensor]], Generator[None, None, None]]:
+    """
+    Context manager for applying context parallelism to a model. In addition to applying the
+    standard context manager to patch SDPA and shard model inputs and buffers along the sequence
+    dimension, this context manager also calls into _get_sdpa_context to filter to acceptable SDPA backends.
+
+    Args:
+        enabled (bool): Whether context parallel is enabled. Default: False
+        rotate_method (str): Method to use for rotating the sequence dimension. Default: "allgather".
+        world_mesh (torch.distributed.DeviceMesh): Global device mesh.
+        model (TransformerDecoder): Model to apply context parallelism to.
+
+    Returns:
+        A context manager applying context parallelism if enabled is True. Otherwise a context manager
+        disabling the math SDPA backend.
+
+    Raises:
+        ValueError: if enabled is True but world_mesh does not contain a "cp" dimension
+
+    Example:
+        ```python
+        context_parallel_manager = get_context_parallel_manager(
+            enabled=parallel_dims.enabled,
+            cp_mesh=world_mesh["cp"] if parallel_dims.enabled else None,
+            model=model,
+        )
+        batch = {"inputs": inputs, "labels": labels}
+        with get_context_parallel_manager(list(batch.values())):
+            logits = model(inputs)
+            loss = loss(logits, labels)
+            loss.backward()
+        ```
+    """
+
+    if enabled and "cp" not in world_mesh.mesh_dim_names:
+        raise ValueError(
+            "Context parallel is enabled but no context parallel device mesh is provided."
+        )
+    # TODO: context parallel for multimodal models requires extra work
+    if enabled and not isinstance(model, TransformerDecoder):
+        raise ValueError("Context parallel is only supported for text models")
+    # TODO: this is a hacky proxy for whether we use flex for chunked attention
+    # remove this once flex is supported
+    if enabled and any([layer.mask_mod is not None for layer in model.layers]):
+        raise ValueError("Context parallel with flex attention is not yet supported")
+
+    @contextlib.contextmanager
+    def context(model_inputs: list[torch.Tensor]):
+        # Create context parallel context if enabled
+        cp_context = None
+        if enabled and any([isinstance(input, BlockMask) for input in model_inputs]):
+            raise ValueError(
+                "Context parallel with flex attention is not yet supported"
+            )
+        if enabled:
+            set_rotate_method(rotate_method)
+            cp_context = context_parallel(
+                world_mesh["cp"],
+                buffers=model_inputs,
+                buffer_seq_dims=[1] * len(model_inputs),
+                no_restore_buffers=set(model_inputs),
+            )
+
+        # Create and enter the train context with the optional cp_context
+        sdpa_context = _get_sdpa_context()
+
+        with sdpa_context(cp_context):
+            yield
+
+    return context
+
+
+def get_train_context(enable_loss_parallel: bool) -> Generator[None, None, None]:
+    @contextlib.contextmanager
+    def context(cp_context: Optional[Generator[None, None, None]] = None):
+        with contextlib.ExitStack() as stack:
+            if enable_loss_parallel:
+                stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
+
+            # because we create a noop ctx manager, this is never None in actual recipes
+            # leave condition so this can be used separately
+            if cp_context is not None:
+                stack.enter_context(cp_context)
+            yield
+
+    return context

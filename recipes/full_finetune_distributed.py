@@ -27,7 +27,9 @@ from torchtune.datasets import ConcatDataset
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import DummyProfiler, PROFILER_KEY
 from torchtune.training.activations import apply_selective_activation_checkpointing
+from torchtune.modules.moe import utils as moe_utils
 from torchtune.training.lr_schedulers import get_lr
+from torch.distributed.tensor.parallel import parallelize_module
 from omegaconf import OmegaConf
 import pprint
 import os
@@ -139,6 +141,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
     """
 
     def __init__(self, cfg: DictConfig) -> None:
+        device_type = cfg.device
         self._device = utils.get_device(device=cfg.device)
         self._dtype = training.get_dtype(cfg.dtype, device=self._device)
 
@@ -158,14 +161,15 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # logging attributes
         self._output_dir = cfg.output_dir
-        self.max_bsize = cfg.max_bsize
+        self.max_bsize = cfg.get("max_bsize", 512)
+
         # extract information from output_dir
         path_parts = self._output_dir.split("/")
-        self.method = cfg.method
+        self.method = cfg.get("method","rft")
         self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
         self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
         self.divide_logits_with_temp = cfg.get("divide_logits_with_temp",True)
-        self.sampling_temperature = cfg["sampling_temperature"]
+        self.sampling_temperature = cfg.get("sampling_temperature", 1.0)
 
         # Look for the date_run pattern in all path segments
         date_run_pattern = None
@@ -199,8 +203,44 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             )
             self._log_peak_memory_stats = False
 
-        world_size, rank = training.get_world_size_and_rank()
-        self._is_rank_zero = rank == 0
+        self.world_size, self.rank = utils.get_world_size_and_rank()
+        self._is_rank_zero = self.rank == 0
+        self.tp_plan = cfg.get("tensor_parallel_plan", None)
+        self.tp_degree = cfg.get("tensor_parallel_dim", 1)
+        if self.tp_degree > 1 and self.tp_plan is None:
+            raise ValueError(
+                "Tensor Parallel plan needs to be provided when tensor parallel is enabled."
+            )
+        if self.tp_degree > 1:
+            # DTensor does not support grouped_mm yet
+            moe_utils.use_grouped_mm = False
+        self.cp_degree = cfg.get("context_parallel_dim", 1)
+        self.context_parallel_rotate_method = cfg.get(
+            "context_parallel_rotate_method", "allgather"
+        )
+        data_shard = cfg.get("data_parallel_shard_dim", -1)  # -1 means to infer
+        data_replicate = cfg.get("data_parallel_replicate_dim", 1)
+        self.context_parallel_rotate_method = cfg.get(
+            "context_parallel_rotate_method", "allgather"
+        )
+
+        self.parallel_dims = training.ParallelDims(
+            dp_replicate=data_replicate,
+            dp_shard=data_shard,
+            tp=self.tp_degree,
+            cp=self.cp_degree,
+            world_size=self.world_size,
+        )
+        self.world_mesh = self.parallel_dims.build_mesh(device_type=device_type)
+
+        if self.parallel_dims.dp_enabled:
+            dp_mesh = self.world_mesh["dp"]
+            self.dp_degree, self.dp_rank = (
+                dp_mesh.size(),
+                dp_mesh.get_local_rank(),
+            )
+        else:
+            self.dp_degree, self.dp_rank = 1, 0
 
         # Training cfg
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
@@ -227,6 +267,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         )
         self._enable_activation_offloading = cfg.get(
             "enable_activation_offloading", False
+        )
+        self._activation_offloading_use_streams = cfg.get(
+            "activation_offloading_use_streams", True
         )
         if self._enable_activation_offloading:
             if self._device.type != "cuda":
@@ -265,12 +308,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # NOTE: added by us
         self.save_checkpoints_interval = cfg.get("save_checkpoints", 1)
-        self.max_seq_len = cfg.get("max_seq_len", None)
+        self.max_seq_len = cfg.get("max_seq_len", 1000000)
         self._max_validation_steps = int(
-            cfg.get("samples_per_validation_steps") / (cfg.batch_size * world_size)
+            cfg.get("samples_per_validation_steps") / (cfg.batch_size * self.world_size)
         )
         effective_batch_size = (
-            cfg.batch_size * cfg.gradient_accumulation_steps * world_size
+            cfg.batch_size * cfg.gradient_accumulation_steps * self.world_size
         )
         self.max_steps_per_epoch = int(
             cfg.get("samples_per_epoch") / effective_batch_size
@@ -351,6 +394,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             cfg_model=cfg.model,
             enable_activation_checkpointing=self._enable_activation_checkpointing,
             enable_activation_offloading=self._enable_activation_offloading,
+            activation_offloading_use_streams=self._activation_offloading_use_streams,
             custom_sharded_layers=cfg.get("custom_sharded_layers", None),
             fsdp_cpu_offload=cfg.get("fsdp_cpu_offload", False),
             reshard_after_forward=cfg.get("fsdp_reshard_after_forward", True),
@@ -398,6 +442,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             cfg_model=cfg.model,
             enable_activation_checkpointing=self._enable_activation_checkpointing,
             enable_activation_offloading=self._enable_activation_offloading,
+            activation_offloading_use_streams=self._activation_offloading_use_streams,
             custom_sharded_layers=cfg.get("custom_sharded_layers", None),
             fsdp_cpu_offload=cfg.get("fsdp_cpu_offload", False),
             reshard_after_forward=cfg.get("fsdp_reshard_after_forward", True),
@@ -696,19 +741,20 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         cfg_model: DictConfig,
         enable_activation_checkpointing: bool,
         enable_activation_offloading: bool,
+        activation_offloading_use_streams: bool,
         fsdp_cpu_offload: bool,
         reshard_after_forward: bool,
-        model_state_dict: Dict[str, Any],
-        custom_sharded_layers: Optional[List[str]] = None,
+        model_state_dict: dict[str, Any],
+        custom_sharded_layers: Optional[list[str]] = None,
         ac_mode: Optional[str] = None,
         ac_option: Optional[int] = None,
     ) -> nn.Module:
         """
         Model initialization has some important considerations:
-           a. To minimize GPU peak memory, we initialize the model on meta device with
-              the right dtype
-           b. All ranks calls ``load_state_dict`` without peaking CPU RAMs since
-              full state dicts are loaded with ``torch.load(mmap=True)``
+        a. To minimize GPU peak memory, we initialize the model on meta device with
+            the right dtype
+        b. All ranks call ``load_state_dict`` without peaking CPU RAMs since
+            full state dicts are loaded with ``torch.load(mmap=True)``
         """
 
         utils.log_rank_zero(
@@ -723,76 +769,113 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         if self._compile:
             training.compile_model(model, verbose=self._is_rank_zero)
 
-        # We currently have two versions of activation checkpointing in this recipe
-        # for testing and BC purposes. ``enable_activation_checkpointing`` controls
-        # the older version of AC and this behavior is unchanged
-        # ac_mode and ac_option together control selective AC. This is only enabled
-        # when these are set AND ``enable_activation_checkpointing`` is set to False
-        # We'll clean this up as soon as testing of AC is complete
-        if (not enable_activation_checkpointing) and (ac_mode is not None):
-            apply_selective_activation_checkpointing(
+        # Tensor Parallel (TP)
+        if getattr(self, "parallel_dims", None) and self.parallel_dims.tp_enabled:
+            if (not self.parallel_dims.dp_enabled) and getattr(self, "fsdp_cpu_offload", False):
+                raise ValueError(
+                    "Tensor parallelism is not supported with FSDP CPU offloading when data parallelism is disabled."
+                )
+            # Prepare attention modules for TP (localize num_heads / kv_heads / embed_dim)
+            model = training.prepare_mha_for_tp(model, self.world_mesh["tp"])
+
+            # Optionally build a TP plan and patch loss if using SFTLoss
+            if getattr(self, "tp_plan", None) is not None:
+                self.tp_plan = config.instantiate(
+                    self.tp_plan,
+                    model=model,
+                    enable_fp8_training=getattr(self, "_enable_fp8_training", False),
+                )
+                if isinstance(getattr(self, "_loss_fn", None), SFTLoss):
+                    self._loss_fn.tp_enabled = True
+                    self.tp_plan = self._loss_fn.patch_tp_plan(self.tp_plan)
+
+            parallelize_module(
                 model,
-                ac_mode,
-                ac_option,
+                self.world_mesh["tp"],
+                parallelize_plan=getattr(self, "tp_plan", None),
             )
 
-        # original activation checkpointing (full) - flip the condition above
+        # Activation checkpointing:
+        # Selective AC if requested and the legacy AC flag is False.
+        if (not enable_activation_checkpointing) and (ac_mode is not None):
+            apply_selective_activation_checkpointing(model, ac_mode, ac_option)
+
+        # Legacy full AC (wrap TransformerSelfAttentionLayer)
         if enable_activation_checkpointing and ac_mode is None:
             training.set_activation_checkpointing(
                 model, auto_wrap_policy={modules.TransformerSelfAttentionLayer}
             )
 
-        # For FSDP sharding
-        fsdp_shard_conditions = [
-            partial(
-                training.get_shard_conditions,
-                names_to_match=custom_sharded_layers,
-            )
-        ]
-        training.shard_model(
-            model=model,
-            shard_conditions=fsdp_shard_conditions,
-            cpu_offload=fsdp_cpu_offload,
-            reshard_after_forward=reshard_after_forward,
-        )
+        # Apply FSDP sharding (mesh-aware)
+        if getattr(self, "parallel_dims", None) and (
+            self.parallel_dims.dp_shard_enabled or self.parallel_dims.cp_enabled
+        ):
+            fsdp_shard_conditions = [
+                partial(training.get_shard_conditions, names_to_match=custom_sharded_layers)
+            ]
+            if self.parallel_dims.dp_replicate_enabled:
+                dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
+            else:
+                dp_mesh_dim_names = ("dp_shard_cp",)
 
+            training.shard_model(
+                model=model,
+                shard_conditions=fsdp_shard_conditions,
+                cpu_offload=fsdp_cpu_offload,
+                reshard_after_forward=reshard_after_forward,
+                dp_mesh=self.world_mesh[dp_mesh_dim_names],
+            )
+
+        # Post-init hooks that must run on the real device (e.g., RoPE init)
         with training.set_default_dtype(self._dtype), self._device:
             for m in model.modules():
-                # RoPE is not covered in state dict
                 if hasattr(m, "rope_init"):
                     m.rope_init()
 
-        # This method will convert the full model state dict into a sharded state
-        # dict and load into the model
+        # Load from a full (unsharded) state dict efficiently
         training.load_from_full_model_state_dict(
             model,
             model_state_dict,
             self._device,
-            self._is_rank_zero,
             strict=True,
             cpu_offload=fsdp_cpu_offload,
         )
 
-        # activation offloading
+        # Activation offloading context (optionally using streams)
         self.activations_handling_ctx = training.get_act_offloading_ctx_manager(
-            model, enable_activation_offloading
+            model, enable_activation_offloading, activation_offloading_use_streams
         )
 
-        # Ensure no params and buffers are on meta device
+        # Context Parallel (CP) manager
+        self.context_parallel_manager = training.get_context_parallel_manager(
+            enabled=getattr(self, "cp_degree", 1) > 1,
+            rotate_method=getattr(self, "context_parallel_rotate_method", "ring"),
+            world_mesh=self.world_mesh,
+            model=model,
+        )
+
+        # Remaining forward/backward contexts (e.g., loss-parallel)
+        self.train_context = training.get_train_context(
+            enable_loss_parallel=getattr(self, "use_loss_parallel_ctx_manager", False),
+        )
+
+        # Ensure no params / buffers remain on meta
         training.validate_no_params_on_meta_device(model)
 
         utils.log_rank_zero(
             log,
             f"Instantiating model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs",
         )
+
         if self._is_rank_zero:
             memory_stats = training.get_memory_stats(device=self._device)
             training.log_memory_stats(memory_stats)
 
-        # synchronize before training begins
-        torch.distributed.barrier()
+        # Synchronize before training begins
+        torch.distributed.barrier(device_ids=[self._device.index])
 
         return model
+
 
     def _setup_optimizer(
         self,
@@ -1157,27 +1240,30 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                         utils.batch_to_device(batch, self._device)
                         # try:
-                        if self.method == "reinforce":
-                            rewards = batch.pop("reward")
-                        val_loss = self._loss_step(batch)
-                        # except RuntimeError as e:
-                        #     log.error(f"Error in validation loss computation: {e}")
-                        #     val_loss = torch.tensor(0.0, device=self._device)
-                        #     continue
-                        cum_val_loss += val_loss
-                        pbar_val.update(1)
-                        pbar_val.set_description(
-                            f"{self.epochs_run+1}|{self.global_step}|Validation Loss: {cum_val_loss / (idx + 1)}"
-                        )
-                        idx += 1
 
-                        if (
-                            self._max_validation_steps is not None
-                            and idx == self._max_validation_steps
-                        ):
-                            break
+                        with self.train_context(
+                            self.context_parallel_manager(list(batch.values()))):
+                            if self.method == "reinforce":
+                                rewards = batch.pop("reward")
+                            val_loss = self._loss_step(batch)
+                            # except RuntimeError as e:
+                            #     log.error(f"Error in validation loss computation: {e}")
+                            #     val_loss = torch.tensor(0.0, device=self._device)
+                            #     continue
+                            cum_val_loss += val_loss
+                            pbar_val.update(1)
+                            pbar_val.set_description(
+                                f"{self.epochs_run+1}|{self.global_step}|Validation Loss: {cum_val_loss / (idx + 1)}"
+                            )
+                            idx += 1
 
-                    mean_val_loss = cum_val_loss / (idx + 1 - max_len_samples)
+                            if (
+                                self._max_validation_steps is not None
+                                and idx == self._max_validation_steps
+                            ):
+                                break
+
+                        mean_val_loss = cum_val_loss / (idx + 1 - max_len_samples)
 
                     gathered_val_loss = [
                         torch.zeros_like(mean_val_loss) for _ in range(world_size)
@@ -1244,75 +1330,81 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Calculate the number of unmasked tokens in the current batch
                 # and increment the total number of tokens seen in the step
-                current_num_tokens = (
-                    batch["labels"] != self._loss_fn.ignore_index
-                ).sum()
-                num_tokens += current_num_tokens
-                # NOTE: added by us
-                # let's monitor the total number of tokens
-                real_num_tokens = batch["labels"].numel()
 
-                # Shape [b, s], needed for the loss not the model
-                labels = batch.pop("labels")
-                if self.method == "reinforce":
-                    reward = batch.pop("reward")
-                else:
-                    reward = 1
 
-                with self.activations_handling_ctx:
-                    logits = self._model(**batch)
-                    if self.divide_logits_with_temp:
+                with self.train_context(
+                    self.context_parallel_manager(list(batch.values()))
+                ):
+                    current_num_tokens = (
+                        batch["labels"] != self._loss_fn.ignore_index
+                    ).sum()
+                    num_tokens += current_num_tokens
+                    # NOTE: added by us
+                    # let's monitor the total number of tokens
+                    real_num_tokens = batch["labels"].numel()
 
-                        if isinstance(logits, list):
-                            logits = [logit / self.sampling_temperature for logit in logits]
-                # calculate the entropy of the models responses
+                    # Shape [b, s], needed for the loss not the model
+                    labels = batch.pop("labels")
+                    if self.method == "reinforce":
+                        reward = batch.pop("reward")
+                    else:
+                        reward = 1
 
-                # Shift labels to compute loss
-                # equivalent to doing labels[..., 1:] and logits[..., :-1, :]
-                # But this way we dont need to slice the logits. We just add an ignore index to labels.
-                labels = torch.hstack(
-                    (labels[..., 1:], self.ignore_labels_cache[: labels.shape[0]])
-                )
-                if not isinstance(logits, list):
-                    labels = labels.reshape(-1)
-                    logits = logits.reshape(-1, logits.size(-1))
+                    with self.activations_handling_ctx:
+                        logits = self._model(**batch)
+                        if self.divide_logits_with_temp:
 
-                # Compute loss
-                # Loss is normalized by default so we multiply by the number of tokens
-                # This way we can normalize by the total number of tokens if we're accumulating gradients
+                            if isinstance(logits, list):
+                                logits = [logit / self.sampling_temperature for logit in logits]
+                    # calculate the entropy of the models responses
 
-                combined_loss = (
-                    self._loss_fn(logits, labels) * current_num_tokens * reward
-                )
-                # before you compute the entropy extract the single logit from the label
-                (
-                    per_token_entropy_sum,
-                    full_token_entropy_sum,
-                    per_token_entropy_mean,
-                    full_token_entropy_mean,
-                ) = self._loss_fn.compute_entropy(logits, labels,ent_weight = self.ent_weight)
+                    # Shift labels to compute loss
+                    # equivalent to doing labels[..., 1:] and logits[..., :-1, :]
+                    # But this way we dont need to slice the logits. We just add an ignore index to labels.
+                    labels = torch.hstack(
+                        (labels[..., 1:], self.ignore_labels_cache[: labels.shape[0]])
+                    )
+                    if not isinstance(logits, list):
+                        labels = labels.reshape(-1)
+                        logits = logits.reshape(-1, logits.size(-1))
 
-                # Update tracking with the correct variable names
-                running_per_token_ent_sum += per_token_entropy_sum.detach()
-                running_full_token_ent_sum += full_token_entropy_sum.detach()
-                running_per_token_ent_mean += per_token_entropy_mean.detach()
+                    # Compute loss
+                    # Loss is normalized by default so we multiply by the number of tokens
+                    # This way we can normalize by the total number of tokens if we're accumulating gradients
+
+                    combined_loss = (
+                        self._loss_fn(logits, labels) * current_num_tokens * reward
+                    )
+                    # before you compute the entropy extract the single logit from the label
+                    (
+                        per_token_entropy_sum,
+                        full_token_entropy_sum,
+                        per_token_entropy_mean,
+                        full_token_entropy_mean,
+                    ) = self._loss_fn.compute_entropy(logits, labels,ent_weight = self.ent_weight)
+
+                    # Update tracking with the correct variable names
+                    running_per_token_ent_sum += per_token_entropy_sum.detach()
+                    running_full_token_ent_sum += full_token_entropy_sum.detach()
+                    running_per_token_ent_mean += per_token_entropy_mean.detach()
+                    
+                    del logits, per_token_entropy_sum,full_token_entropy_sum,per_token_entropy_mean
+
                 
-                del logits, per_token_entropy_sum,full_token_entropy_sum,per_token_entropy_mean
-
-                if self.ent_weight > 0:
-                    combined_loss = combined_loss + self.ent_weight * full_token_entropy_mean
-                running_full_token_ent_mean += full_token_entropy_mean.detach()
-                del full_token_entropy_mean
-                running_loss += combined_loss.detach()
+                    if self.ent_weight > 0:
+                        combined_loss = combined_loss + self.ent_weight * full_token_entropy_mean
+                    running_full_token_ent_mean += full_token_entropy_mean.detach()
+                    del full_token_entropy_mean
+                    running_loss += combined_loss.detach()
 
 
-                # For optimizer in backward, we need to normalize before calling backward
-                # This case and gradient accumulation are mutually exclusive
-                if self._optimizer_in_bwd:
-                    torch.distributed.all_reduce(num_tokens)
-                    torch.distributed.all_reduce(running_loss)
-                    combined_loss = combined_loss / num_tokens
-                combined_loss.backward()
+                    # For optimizer in backward, we need to normalize before calling backward
+                    # This case and gradient accumulation are mutually exclusive
+                    if self._optimizer_in_bwd:
+                        torch.distributed.all_reduce(num_tokens)
+                        torch.distributed.all_reduce(running_loss)
+                        combined_loss = combined_loss / num_tokens
+                    combined_loss.backward()
                 del combined_loss
                 # Step with optimizer
                 if (idx + 1) % self._gradient_accumulation_steps == 0 or (

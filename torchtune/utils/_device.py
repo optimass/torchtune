@@ -21,6 +21,19 @@ else:
     BlockMask = torch.Tensor
 
 
+def get_world_size_and_rank() -> tuple[int, int]:
+    """Function that gets the current world size (aka total number
+    of ranks) and rank number of the current process in the default process group.
+
+    Returns:
+        tuple[int, int]: world size, rank
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(), torch.distributed.get_rank()
+    else:
+        return 1, 0
+
+
 def is_torch_npu_available() -> bool:
     """Check the availability of NPU"""
     try:
@@ -32,6 +45,19 @@ def is_torch_npu_available() -> bool:
 
 
 is_npu_available = is_torch_npu_available()
+
+
+def is_torch_hpu_available() -> bool:
+    """Check the availability of HPU"""
+    try:
+        import habana_frameworks.torch  # noqa: F401
+
+        return torch.hpu.is_available()
+    except ImportError:
+        return False
+
+
+is_hpu_available = is_torch_hpu_available()
 
 
 def _get_local_rank() -> Optional[int]:
@@ -55,6 +81,7 @@ def _setup_device(device: torch.device) -> torch.device:
 
     Raises:
         RuntimeError: If device index is not available.
+        AttributeError: If ``set_device`` is not supported for the device type (e.g. on MPS).
 
     Returns:
         device
@@ -73,6 +100,10 @@ def _setup_device(device: torch.device) -> torch.device:
         raise RuntimeError(
             f"The local rank is larger than the number of available {device_name}s."
         )
+    if not hasattr(torch_device, "set_device"):
+        raise AttributeError(
+            f"The device type {device_type} does not support the `set_device` method."
+        )
     torch_device.set_device(device)
     return device
 
@@ -80,7 +111,7 @@ def _setup_device(device: torch.device) -> torch.device:
 def _get_device_type_from_env() -> str:
     """Function that gets the torch.device based on the current machine.
 
-    This currently only supports CPU, CUDA, NPU.
+    This currently only supports CPU, CUDA, NPU, XPU, and MPS.
 
     Returns:
         device
@@ -89,6 +120,12 @@ def _get_device_type_from_env() -> str:
         device = "cuda"
     elif is_npu_available:
         device = "npu"
+    elif is_hpu_available:
+        device = "hpu"
+    elif torch.xpu.is_available():
+        device = "xpu"
+    elif torch.mps.is_available():
+        device = "mps"
     else:
         device = "cpu"
     return device
@@ -136,7 +173,7 @@ def get_device(device: Optional[str] = None) -> torch.device:
     If CUDA-like is available and being used, this function also sets the CUDA-like device.
 
     Args:
-        device (Optional[str]): The name of the device to use, e.g. "cuda" or "cpu" or "npu".
+        device (Optional[str]): The name of the device to use, one of "cuda", "cpu", "npu", "xpu", or "mps".
 
     Example:
         >>> device = get_device("cuda")
@@ -149,7 +186,7 @@ def get_device(device: Optional[str] = None) -> torch.device:
     if device is None:
         device = _get_device_type_from_env()
     device = torch.device(device)
-    if device.type in ["cuda", "npu"]:
+    if device.type in ["cuda", "npu", "xpu", "hpu"]:
         device = _setup_device(device)
     _validate_device_from_env(device)
     return device
@@ -162,10 +199,11 @@ def batch_to_device(batch: dict, device: torch.device) -> None:
 
     Args:
         batch (dict): dict of Tensors or more nested dicts of tensors.
-        device (torch.device): torch device to move the tensor's too
+        device (torch.device): torch device to move the tensors to.
 
     Raises:
-        AttributeError: if batch dict contains anything other than tensors
+        ValueError: if batch dict contains anything other than ``torch.Tensor``.
+
     """
     for k, v in batch.items():
         if isinstance(v, dict):
@@ -184,16 +222,20 @@ Got key "{k}" with value of type {type(v)}"""
 class DeviceSupport(Enum):
     """
     This is a simple enum for compute devices,
-    This currently only supports CPU, CUDA, NPU.
+    This currently only supports CPU, CUDA, NPU, and XPU.
     The following enumeration defines various device configurations with attributes:
-    1. `device_type` (str): The type of device (e.g., "cpu", "cuda", "npu").
-    2. `device_name` (str): A user-friendly name for the device (e.g., "CPU", "GPU", "NPU").
-    3. `communication_backend` (str): Specifies the backend used for communication on this device (e.g., "gloo", "nccl", "hccl").
+    1. `device_type` (str): The type of device (e.g., "cpu", "cuda", "npu", "xpu", "mps").
+    2. `device_name` (str): A user-friendly name for the device (e.g., "CPU", "GPU", "NPU", "XPU", "MPS").
+    3. `communication_backend` (str): Specifies the backend used for communication on this device
+    (e.g., "gloo", "nccl", "hccl", "ccl").
     """
 
     CPU = ("cpu", "CPU", "gloo")
     CUDA = ("cuda", "GPU", "nccl")
     NPU = ("npu", "NPU", "hccl")
+    XPU = ("xpu", "XPU", "ccl")
+    MPS = ("mps", "MPS", "gloo")
+    HPU = ("hpu", "HPU", "hccl")
 
     def __init__(
         self,
@@ -216,7 +258,7 @@ class DeviceSupport(Enum):
 def get_device_support() -> DeviceSupport:
     """function that gets the DeviceSupport with compute devices based on the current machine.
 
-    This currently only supports CPU, CUDA, NPU.
+    This currently only supports CPU, CUDA, NPU, XPU, and MPS.
 
     Returns:
         device_support: DeviceSupport
@@ -239,3 +281,10 @@ def get_torch_device_namespace() -> any:
             f"Device namespace '{device_type}' not found in torch, try to load torch.cuda."
         )
         return torch.cuda
+
+
+def has_cuda_capability(major: int, minor: int) -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
+        major,
+        minor,
+    )
