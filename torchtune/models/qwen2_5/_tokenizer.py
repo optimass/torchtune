@@ -37,12 +37,7 @@ QWEN2_5_SPECIAL_TOKENS = {
     "<|repo_name|>": 151663,
     "<|file_sep|>": 151664,
 }
-template = {
-    "system":    ("<|im_start|>system\n",    "<|im_end|>\n"),
-    "user":      ("<|im_start|>user\n",      "<|im_end|>\n"),
-    "assistant": ("<|im_start|>assistant\n", "<|im_end|>\n"),
-}
-prompt_template=PromptTemplate(template=template)
+
 class Qwen2_5Tokenizer(Qwen2Tokenizer):  # noqa: N801
     """This class construct a Qwen2.5 tokenizer, based on GPT-2 byte-level BPE tokenization.
 
@@ -95,7 +90,7 @@ class Qwen2_5Tokenizer(Qwen2Tokenizer):  # noqa: N801
         special_tokens: Dict[str, int] = QWEN2_5_SPECIAL_TOKENS,
         max_seq_len: Optional[int] = None,
         *,
-        prompt_template: Optional[PromptTemplate] = prompt_template,
+        prompt_template: Optional[PromptTemplate] = None,
         errors: str = "replace",
         unk_token: Optional[str] = ENDOFTEXT,
         bos_token: Optional[str] = None,
