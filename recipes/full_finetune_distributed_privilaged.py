@@ -588,7 +588,6 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         # Also store batch info for matching during training
         self.batch_info_cache = {} if self.use_importance_sampling else None
         batch_idx = 0
-      
 
         # Track trajectory indices and steps for GRPO grouping
         all_trajectory_indices: List[int] = []
@@ -608,14 +607,16 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             action_start_pos_with_priv = batch["with_privilege"]["action_start_pos"]
             action_end_pos_with_priv = batch["with_privilege"]["action_end_pos"]
 
-
-            end_of_prompt_without_priv = batch["without_privilege_target_action"]["end_of_prompt"]
+            end_of_prompt_without_priv = batch["without_privilege_target_action"][
+                "end_of_prompt"
+            ]
             action_start_pos_without_priv = batch["without_privilege_target_action"][
                 "action_start_pos"
             ]
-            action_end_pos_without_priv = batch["without_privilege_target_action"]["action_end_pos"]
+            action_end_pos_without_priv = batch["without_privilege_target_action"][
+                "action_end_pos"
+            ]
 
-            
             trajectory_index = batch["trajectory_index"]
             step_ids = batch.get("step", None)
 
@@ -731,10 +732,11 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
             # Use KL divergence as rewards with gamma weighting
             if action_log_ps_as_reward:
-                rewards = reward + action_log_prob_without_privilege 
+                rewards = reward + action_log_prob_without_privilege
             else:
                 rewards = reward + (
-                    action_log_prob_without_privilege - self.gamma * kl_divergence
+                    torch.clamp(action_log_prob_without_privilege, min=-1.0)
+                    - self.gamma * kl_divergence
                 )
             # if action_log_prob_with_privilege != action_log_prob_without_privilege else torch.tensor([-1.0], device=self._device)
 
@@ -757,7 +759,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             kls.extend(kl_divergence.cpu().tolist())
 
             batch_idx += 1
-
+        rewards = rescale_rewards(all_rewards)
         # Group rewards by goal
         rewards_by_goal = {}
         for goal, reward in zip(all_goals, all_rewards):
@@ -1014,7 +1016,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 n_samples * n_gpus
             ) % self._gradient_accumulation_steps
 
-            for j, batch in (enumerate(self._dataloader)):
+            for j, batch in enumerate(self._dataloader):
                 if ((idx // self._gradient_accumulation_steps)) >= (
                     self._steps_per_epoch
                 ) and not self.max_bsize:
@@ -1111,7 +1113,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     combined_loss = self._loss_fn(
                         logits=loss_logits, labels=labels_shifted
                     )
-                if use_rl: 
+                if use_rl:
                     log.info(f"Using RL loss at idx {idx} for sample {j}")
 
                 running_loss += combined_loss.detach()
@@ -1335,7 +1337,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 q_z_g_xy_mean,
                 rewards_by_goal,
                 kls,
-                p_y_g_zx_all
+                p_y_g_zx_all,
             ) = self.compute_rewards()
 
             # TODO: This is hacky need a better way to do this but this will work for now
@@ -1390,7 +1392,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             number_leftover_samples = (
                 n_samples * n_gpus
             ) % self._gradient_accumulation_steps
-            for j, batch in (enumerate(self._dataloader)):
+            for j, batch in enumerate(self._dataloader):
                 if ((idx // self._gradient_accumulation_steps)) >= (
                     self._steps_per_epoch
                 ) and not self.max_bsize:
@@ -1469,12 +1471,10 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 if not isinstance(logits, list):
                     labels = labels.reshape(-1)
                     logits = logits.reshape(-1, logits.size(-1))
-                
-                
+
                 # logits = index_chunkced(logits,  action_start_pos)
                 # labels = labels[:, :action_start_pos]
-                
-                
+
                 combined_loss = self._loss_fn(
                     logits=logits,
                     labels=labels,
@@ -1701,7 +1701,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 q_z_g_xy_mean,
                 rewards_by_goal,
                 kls,
-                p_y_g_zx_all
+                p_y_g_zx_all,
             ) = self.compute_rewards(action_log_ps_as_reward=True)
 
             # TODO: This is hacky need a better way to do this but this will work for now
@@ -1838,7 +1838,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     logits = logits.reshape(-1, logits.size(-1))
 
                 # index for labels of the cot only
-                
+
                 # logits = index_chunkced(logits,  action_start_pos)
                 # labels = labels[:, :action_start_pos]
 
@@ -1999,6 +1999,31 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
         self._profiler.stop()
 
+
+
+def rescale_rewards(all_rewards):
+    """
+    Min-max scale a list of rewards to the range [-1, 1].
+    - Empty list -> []
+    - All rewards identical -> all zeros
+    """
+    if not all_rewards:
+        return []
+    try:
+        min_r = float(min(all_rewards))
+        max_r = float(max(all_rewards))
+    except TypeError:
+        # If values are not comparable/numeric, return as-is
+        return all_rewards
+    if max_r == min_r:
+        return [0.0 for _ in all_rewards]
+    denom = max_r - min_r
+    scaled = [2.0 * ((float(r) - min_r) / denom) - 1.0 for r in all_rewards]
+    # Clamp for numerical safety
+    return [max(-1.0, min(1.0, s)) for s in scaled]
+
+
+
 def index_chunkced(chunked, index):
     """Concatenate chunked [B, T_i, D] tensors, slice up to index along seq dim, then re-chunk.
 
@@ -2013,10 +2038,11 @@ def index_chunkced(chunked, index):
     # Concatenate along sequence dimension [B, S_total, D]
     num_chunks = len(chunked)
     unchunked = torch.cat(chunked, dim=1)
-    unchunked = unchunked[...,:index, :]
+    unchunked = unchunked[..., :index, :]
     rechunked = unchunked.chunk(num_chunks, dim=1)
 
     return rechunked
+
 
 @config.parse
 def recipe_main(cfg: DictConfig) -> None:
