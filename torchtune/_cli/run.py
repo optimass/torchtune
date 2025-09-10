@@ -20,11 +20,18 @@ from torch.distributed.run import get_args_parser as get_torchrun_args_parser, r
 from torchtune._cli.subcommand import Subcommand
 from torchtune._recipe_registry import Config, get_all_recipes, Recipe
 
+# NOTE: needed some modifications here, not sure why
 # ROOT = Path(torchtune.__file__).parent.parent
-try:
-    ROOT = Path(torchtune.__file__).parent.parent
-except:
-    ROOT = "/home/toolkit/ui-copilot/finetuning/torchtune"
+
+ROOT = torchtune.__file__
+if ROOT is not None:
+    ROOT = Path(ROOT).parent.parent
+else:
+    ROOT = torchtune.__path__[0]
+    if ROOT is not None:
+        ROOT = Path(ROOT)
+    else:
+        raise ValueError(f"ROOT path {ROOT} does not exist.")
 
 
 class Run(Subcommand):
