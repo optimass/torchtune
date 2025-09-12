@@ -3,6 +3,8 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import os
+import debugpy
 
 from copy import deepcopy
 import sys
@@ -14,8 +16,10 @@ from warnings import warn
 import re
 import torch
 from omegaconf import DictConfig, ListConfig
+import matplotlib.pyplot as plt
 
 from torch import nn
+import torch.nn.functional as F
 from torch.distributed import destroy_process_group, init_process_group
 
 from torch.optim import Optimizer
@@ -23,6 +27,12 @@ from torch.utils.data import DataLoader, DistributedSampler, Subset
 from torchtune import config, modules, training, utils
 from torchtune.config._utils import _get_component_from_path
 from torchtune.data import padded_collate_packed
+
+try:
+    # Optional: directly set collate multiple in-process
+    from torchtune.data._collate import set_min_seq_multiple as _set_min_seq_multiple
+except Exception:
+    _set_min_seq_multiple = None
 from torchtune.datasets import ConcatDataset
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import DummyProfiler, PROFILER_KEY
@@ -34,13 +44,13 @@ from omegaconf import OmegaConf
 import pprint
 import os
 import re
-import os
-import debugpy
+
 import random
 from tqdm import tqdm
+import threading
+
 # Add debugpy support for remote debugging
 
-# Check if debugging should be enabled via environment variable
 debug_enabled = os.environ.get("ENABLE_DEBUGPY", "0").lower() in ("1", "true", "yes")
 
 debug_port = 5678
@@ -50,14 +60,25 @@ if debug_enabled:
     # Allow remote connections
     debugpy.listen(("0.0.0.0", debug_port))
     print(f"🐞 Debugpy listening on port {debug_port}")
-    
 
-    print(f"⏳ Waiting for debugger to attach on port {debug_port}...")
-    debugpy.wait_for_client()
-    print("🔗 Debugger attached!")
+    print(f"⏳ Waiting up to 1 minute for debugger to attach on port {debug_port}...")
+
+    # Run wait_for_client in a thread to not block indefinitely
+    wait_thread = threading.Thread(target=debugpy.wait_for_client)
+    wait_thread.daemon = True
+    wait_thread.start()
+
+    wait_thread.join(timeout=60.0)
+
+    if wait_thread.is_alive():
+        print("⏰ Timeout reached. Continuing without debugger.")
+    else:
+        print("🔗 Debugger attached!")
 
 
 log = utils.get_logger("DEBUG")
+
+# Check if debugging should be enabled via environment variable
 
 
 class FullFinetuneRecipeDistributed(FTRecipeInterface):
@@ -111,40 +132,18 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             checkpointing.
 
         - Checkpointing. Model weights are checkpointed both at the end of each epoch and at the end of
-            training. Optimizer state and recipe state (seed, total_epochs, number of epochs run etc) are
-            only saved at the end of a given epoch and used in case of resuming training.
+          training. Optimizer state and recipe state (seed, total_epochs, number of epochs run etc) are
+          only saved at the end of a given epoch and used in case of resuming training.
 
-            Resuming training is controlled by the ``resume_from_checkpoint`` flag. Mid-epoch checkpointing is
-            currently not supported.
+    """  # End of class docstring
 
-            For more details on the checkpointer, please take a look at
-            our checkpointer deepdive (https://pytorch.org/torchtune/main/deep_dives/checkpointer.html).
-
-        - Logging. Terminal, Disk, WandB and TensorBoard are all supported.
-
-        - Gradient Clipping. Gradient clipping is supported using the ``clip_grad_norm`` flag. By default,
-            ``clip_grad_norm`` is set to ``None``. If you only want to log the grad norm, you can set
-            ``clip_grad_norm='inf'``.
-
-    For a full list of example configs for this recipe, run ``tune ls`` on the command line. Each config
-    has example commands for how to kick-off training.
-
-    Args:
-        cfg (DictConfig): OmegaConf object parsed from yaml file
-
-    Raises:
-        ValueError: If ``dtype`` is set to fp16.
-        RuntimeError: If ``dtype`` is set to bf16 and the hardware does not support bf16.
-        RuntimeError: If ``left_pad_sequence`` is set as the data collator.
-        RuntimeError: If ``enable_activation_offloading`` is True and device is not CUDA.
-        RuntimeError: If ``enable_activation_offloading`` is True and ``enable_activation_checkpointing`` is False.
-    """
-
-    def __init__(self, cfg: DictConfig) -> None:
+    def __init__(
+        self, cfg: DictConfig
+    ) -> None:  # reintroduce __init__ (was earlier before patch corruption)
         device_type = cfg.device
         self._device = utils.get_device(device=cfg.device)
         self._dtype = training.get_dtype(cfg.dtype, device=self._device)
-
+        self.reference_set = False
         if self._dtype == torch.float16:
             raise ValueError(
                 "full fp16 training is not supported with this recipe. Please use bf16 or fp32 instead."
@@ -165,11 +164,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # extract information from output_dir
         path_parts = self._output_dir.split("/")
-        self.method = cfg.get("method","rft")
+        self.method = cfg.get("method", "rft")
         self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
         self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
-        self.divide_logits_with_temp = cfg.get("divide_logits_with_temp",True)
-        self.sampling_temperature = cfg.get("sampling_temperature", 1.0)
+        self.divide_logits_with_temp = cfg.get("divide_logits_with_temp", True)
+        self.sampling_temperature = cfg["sampling_temperature"]
 
         # Look for the date_run pattern in all path segments
         date_run_pattern = None
@@ -179,7 +178,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 date_run_pattern = match
                 break
         if not date_run_pattern:
-            # Fallback if pattern not found
             log.warning(
                 f"Could not extract date_run pattern from path: {self._output_dir}"
             )
@@ -189,14 +187,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             date_part = date_run_pattern.group(1)
             run_name_part = date_run_pattern.group(2)
 
-        # Extract epoch and seed
-        # TODO: never use regex on paths, use configs
         epoch_match = re.search(r"epoch_(\d+)", path_parts[-2])
         self.epoch = int(epoch_match.group(1) if epoch_match else "0")
-        # Construct run_id using date, run_name, epoch and seed
-        # TODO: we should just pass this in the config
         self.run_id = f"{date_part}_{run_name_part}"
         self.ent_weight = cfg.get("ent_weight", 0.0)
+        self.apply_advantage_in_tune = cfg.get("apply_advantage_in_tune", False)
+        self.use_importance_sampling = cfg.get("use_importance_sampling", False)
         if self._log_peak_memory_stats and self._device.type != "cuda":
             log.info(
                 "log_peak_memory_stats was set to True, however, training does not use cuda. Setting log_peak_memory_stats=False."
@@ -212,17 +208,40 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 "Tensor Parallel plan needs to be provided when tensor parallel is enabled."
             )
         if self.tp_degree > 1:
-            # DTensor does not support grouped_mm yet
             moe_utils.use_grouped_mm = False
         self.cp_degree = cfg.get("context_parallel_dim", 1)
         self.context_parallel_rotate_method = cfg.get(
             "context_parallel_rotate_method", "allgather"
         )
-        data_shard = cfg.get("data_parallel_shard_dim", -1)  # -1 means to infer
+        data_shard = cfg.get("data_parallel_shard_dim", -1)
         data_replicate = cfg.get("data_parallel_replicate_dim", 1)
         self.context_parallel_rotate_method = cfg.get(
             "context_parallel_rotate_method", "allgather"
         )
+
+        # Ensure collate functions see a CP-safe sequence multiple.
+        # CP requires seq_len % (2 * tp * cp) == 0 along the sequence dimension.
+        try:
+            if self.cp_degree and self.cp_degree > 1:
+                required_multiple = (
+                    2 * max(1, int(self.tp_degree)) * int(self.cp_degree)
+                )
+                current_env = os.environ.get("TUNE_MIN_SEQ_MULTIPLE")
+                if current_env is None or int(current_env) != required_multiple:
+                    os.environ["TUNE_MIN_SEQ_MULTIPLE"] = str(required_multiple)
+                    utils.log_rank_zero(
+                        log,
+                        f"Set TUNE_MIN_SEQ_MULTIPLE={required_multiple} for CP (tp={self.tp_degree}, cp={self.cp_degree}).",
+                    )
+                if _set_min_seq_multiple is not None:
+                    _set_min_seq_multiple(required_multiple)
+            else:
+                # Do not force a multiple when CP is disabled; leave any user-provided value as-is.
+                pass
+        except Exception as e:
+            utils.log_rank_zero(
+                log, f"Warning: could not set TUNE_MIN_SEQ_MULTIPLE automatically: {e}"
+            )
 
         self.parallel_dims = training.ParallelDims(
             dp_replicate=data_replicate,
@@ -294,7 +313,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.epsilon_low_neg = cfg.get("epsilon_low_neg", 0.8)
         self.epsilon_high_pos = cfg.get("epsilon_high_pos", 1.2)
         self.epsilon_high_neg = cfg.get("epsilon_high_neg", 1.2)
+        self.gamma = cfg.get("gamma", 1.0)
+        self.unsuccessful_negative_reward = cfg.get(
+            "unsuccessful_negative_reward", False
+        )
         self.use_reference = cfg.get("use_reference", False)
+        self.flip_reward_control_variate = cfg.get("flip_reward_control_variate", False)
 
         # Add storage for precomputed reference logprobs
         self.reference_logprobs_cache = {}
@@ -437,6 +461,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._metric_logger.log_config(cfg)
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
 
+        checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
+
         self._compile = cfg.get("compile", False)
         self._model = self._setup_model(
             cfg_model=cfg.model,
@@ -450,7 +476,33 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             ac_mode=cfg.get("ac_mode", None),
             ac_option=cfg.get("ac_option", None),
         )
+
+        # if cfg.ref_checkpointer.checkpoint_dir != "" and not cfg.train_p:
+        if False:
+            ref_checkpoint_dict = self.load_checkpoint(
+                cfg_checkpointer=cfg.ref_checkpointer
+            )
+
+            self.reference_set = True
+            self._ref_model = self._setup_model(
+                cfg_model=cfg.model,
+                enable_activation_checkpointing=self._enable_activation_checkpointing,
+                enable_activation_offloading=self._enable_activation_offloading,
+                custom_sharded_layers=cfg.get("custom_sharded_layers", None),
+                fsdp_cpu_offload=cfg.get("fsdp_cpu_offload", False),
+                reshard_after_forward=cfg.get("fsdp_reshard_after_forward", True),
+                model_state_dict=ref_checkpoint_dict[training.MODEL_KEY],
+                ac_mode=cfg.get("ac_mode", None),
+                ac_option=cfg.get("ac_option", None),
+            )
+        else:
+            self._ref_model = self._model
+
+        utils.log_rank_zero(log, "Model setup complete.")
+
         self._tokenizer = config.instantiate(cfg.tokenizer)
+
+        utils.log_rank_zero(log, "Tokenizer setup complete.")
 
         self._optimizer = self._setup_optimizer(
             cfg_optimizer=cfg.optimizer,
@@ -462,6 +514,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             ),
         )
 
+        utils.log_rank_zero(log, "Optimizer setup complete.")
+
         # initialize loss
         self._loss_fn = config.instantiate(cfg.loss)
 
@@ -471,6 +525,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         if self._loss_fn.__class__.__name__ == "CEWithChunkedOutputLoss":
             # set num_output_chunks for model
             self._model.set_num_output_chunks(self._loss_fn.num_output_chunks)
+            self._ref_model.set_num_output_chunks(self._loss_fn.num_output_chunks)
 
         utils.log_rank_zero(log, "Loss is initialized.")
 
@@ -491,6 +546,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             collate_name = cfg.get(
                 "collate_fn", "torchtune.data.padded_collate_reinforce"
             )
+        elif self.method == "priv":
+            collate_name = cfg.get(
+                "collate_fn", "torchtune.data.padded_collate_privilege"
+            )
         cfg.dataset["split"] = "train"  # NOTE: added by us
         self._sampler, self._dataloader = self._setup_data(
             cfg_dataset=cfg.dataset,
@@ -498,6 +557,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             batch_size=cfg.batch_size,
             collate_fn=collate_name,
         )
+
+        utils.log_rank_zero(log, "Train data setup complete.")
 
         # NOTE: added by us
         # validation dataloader
@@ -562,6 +623,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._sampler_validation_list.append(sampler_validation)
             self._dataloader_validation_list.append(dataloader_validation)
 
+        utils.log_rank_zero(log, "Validation data setup complete.")
+
         # Finally update the recipe state which can only be correctly set after all of the
         # other components have been initialized and updated.
         #
@@ -618,6 +681,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.ignore_labels_cache = torch.full(
             (cfg.batch_size, 1), self._loss_fn.ignore_index, device=self._device
         )
+
+        utils.log_rank_zero(log, "Full recipe setup complete.")
 
     def _setup_lr_scheduler(
         self,
@@ -771,7 +836,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Tensor Parallel (TP)
         if getattr(self, "parallel_dims", None) and self.parallel_dims.tp_enabled:
-            if (not self.parallel_dims.dp_enabled) and getattr(self, "fsdp_cpu_offload", False):
+            if (not self.parallel_dims.dp_enabled) and getattr(
+                self, "fsdp_cpu_offload", False
+            ):
                 raise ValueError(
                     "Tensor parallelism is not supported with FSDP CPU offloading when data parallelism is disabled."
                 )
@@ -785,7 +852,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     model=model,
                     enable_fp8_training=getattr(self, "_enable_fp8_training", False),
                 )
-                if isinstance(getattr(self, "_loss_fn", None), SFTLoss):
+                if (
+                    getattr(self, "_loss_fn", None) is not None
+                    and getattr(self, "_loss_fn").__class__.__name__ == "SFTLoss"
+                ):
                     self._loss_fn.tp_enabled = True
                     self.tp_plan = self._loss_fn.patch_tp_plan(self.tp_plan)
 
@@ -811,7 +881,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self.parallel_dims.dp_shard_enabled or self.parallel_dims.cp_enabled
         ):
             fsdp_shard_conditions = [
-                partial(training.get_shard_conditions, names_to_match=custom_sharded_layers)
+                partial(
+                    training.get_shard_conditions, names_to_match=custom_sharded_layers
+                )
             ]
             if self.parallel_dims.dp_replicate_enabled:
                 dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
@@ -875,7 +947,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         torch.distributed.barrier(device_ids=[self._device.index])
 
         return model
-
 
     def _setup_optimizer(
         self,
@@ -997,6 +1068,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             new_single_cfg_dataset.pop("portion", None)
             ds = config.instantiate(new_single_cfg_dataset, self._tokenizer)
             packed = new_single_cfg_dataset.get("packed", False)
+            new_system_prompt = new_single_cfg_dataset.get("new_system_prompt", None)
 
         # if isinstance(cfg_dataset, ListConfig):
         #     datasets = [
@@ -1014,8 +1086,17 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             raise RuntimeError("left_pad_sequence collator is only for inference.")
         collate_fn = _get_component_from_path(collate_fn)
 
+        # Important: shard data only across data-parallel ranks (dp mesh), not across CP.
+        # This ensures CP ranks within the same dp shard see identical batches and
+        # avoids NCCL/CP collective mismatches.
+        num_replicas = getattr(self, "dp_degree", world_size)
+        rank_in_group = getattr(self, "dp_rank", rank)
         sampler = DistributedSampler(
-            ds, num_replicas=world_size, rank=rank, shuffle=shuffle, seed=self.seed
+            ds,
+            num_replicas=num_replicas,
+            rank=rank_in_group,
+            shuffle=shuffle,
+            seed=self.seed,
         )
         dataloader = DataLoader(
             dataset=ds,
@@ -1024,10 +1105,25 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             # dropping last avoids shape issues with compile + flex attention
             drop_last=True,
             collate_fn=(
-                partial(
-                    collate_fn,
-                    padding_idx=self._tokenizer.pad_id,
-                    ignore_idx=self._loss_fn.ignore_index,
+                (
+                    lambda fn: (
+                        lambda batch: self._cp_safe_pad(
+                            fn(batch),
+                            required_multiple=(
+                                2 * max(1, int(self.tp_degree)) * int(self.cp_degree)
+                                if int(self.cp_degree) > 1
+                                else None
+                            ),
+                            pad_id=self._tokenizer.pad_id,
+                            ignore_idx=self._loss_fn.ignore_index,
+                        )
+                    )
+                )(
+                    partial(
+                        collate_fn,
+                        padding_idx=self._tokenizer.pad_id,
+                        ignore_idx=self._loss_fn.ignore_index,
+                    )
                 )
                 if not packed
                 else padded_collate_packed
@@ -1037,6 +1133,46 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         utils.log_rank_zero(log, "Dataset and Sampler are initialized.")
 
         return sampler, dataloader
+
+    def _cp_safe_pad(
+        self,
+        batch: Dict[str, torch.Tensor],
+        *,
+        required_multiple: Optional[int],
+        pad_id: int,
+        ignore_idx: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Ensure tokens/labels (and masks when present) are padded to required multiple.
+
+        This is a last-mile guard in case env-based or collate-level padding didn't apply.
+        """
+        if not required_multiple or required_multiple <= 1:
+            return batch
+        tokens = batch.get("tokens")
+        if tokens is None or tokens.dim() < 2:
+            return batch
+        L = tokens.size(1)
+        pad = (required_multiple - (L % required_multiple)) % required_multiple
+        if pad == 0:
+            return batch
+        # Pad tokens and labels on the right
+        batch["tokens"] = F.pad(tokens, (0, pad), value=pad_id)
+        if "labels" in batch:
+            batch["labels"] = F.pad(batch["labels"], (0, pad), value=ignore_idx)
+        # Extend encoder_mask time dim if present: shape (bsz, T, ...)
+        if "encoder_mask" in batch and batch["encoder_mask"].dim() >= 2:
+            em = batch["encoder_mask"]
+            # pad along dim=1 (time)
+            pad_shape = [0, 0] * em.dim()
+            # F.pad order is last dim first; build for dim=1
+            time_pad_idx = 2 * (em.dim() - 1 - 1)  # dim=1 from left
+            pad_shape[time_pad_idx + 1] = pad
+            batch["encoder_mask"] = F.pad(em, tuple(pad_shape), value=0)
+        # Extend generic 3D causal mask if present (bsz, T, T)
+        if "mask" in batch and batch["mask"].dim() == 3:
+            m = batch["mask"]
+            batch["mask"] = F.pad(m, (0, pad, 0, pad), value=0)
+        return batch
 
     def save_checkpoint(
         self,
@@ -1157,16 +1293,171 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         labels = torch.hstack(
             (labels[..., 1:], self.ignore_labels_cache[: labels.shape[0]])
         )
-        if not isinstance(logits, list):
-            labels = labels.reshape(-1)
-            logits = logits.reshape(-1, logits.size(-1))
 
-        # Compute loss
-        loss = self._loss_fn(logits, labels)
+        # Compute loss (CP-safe): align labels with actual logits chunk sizes if needed
+        loss = self._compute_ce_cp_safe(logits, labels)
         # free logits otherwise it peaks backward memory
         del logits
 
         return loss
+
+    def _compute_ce_cp_safe(
+        self, logits: Union[torch.Tensor, List[torch.Tensor]], labels: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute normalized CE loss while aligning labels with logits chunk sizes.
+
+        - If logits is a list of chunks [B, Ti, V], split labels along dim=1 by [Ti].
+        - For a single logits tensor [B, T, V], flatten both and compute CE directly.
+
+        Returns a loss normalized by the number of valid tokens (labels != ignore_index),
+        matching CEWithChunkedOutputLoss semantics without modifying that module.
+        """
+        ignore_idx = self._loss_fn.ignore_index
+
+        if isinstance(logits, list):
+            # Derive per-chunk token lengths from logits, and split labels accordingly
+            chunk_lengths = [t.size(1) for t in logits]
+            total_T = sum(chunk_lengths)
+            if labels.size(1) != total_T:
+                # Trim or pad (with ignore) labels to match total logits length
+                if labels.size(1) > total_T:
+                    labels = labels[:, :total_T]
+                else:
+                    pad = total_T - labels.size(1)
+                    labels = F.pad(labels, (0, pad), value=ignore_idx)
+
+            label_chunks = torch.split(labels, chunk_lengths, dim=1)
+
+            total_valid = (labels != ignore_idx).sum()
+            total_valid = torch.clamp(total_valid, min=1)
+
+            total_loss = labels.new_zeros((), dtype=torch.float32)
+            for logit, l2d in zip(logits, label_chunks):
+                # Flatten per-chunk and compute sum loss via CE helper
+                logit2d = logit.reshape(-1, logit.size(-1))
+                l1d = l2d.reshape(-1)
+                total_loss = total_loss + self._loss_fn.compute_cross_entropy(
+                    logit2d, l1d
+                )
+            return total_loss / total_valid
+        else:
+            # Single logits tensor case
+            logits2d = logits.reshape(-1, logits.size(-1))
+            labels1d = labels.reshape(-1)
+            total_valid = (labels1d != ignore_idx).sum()
+            total_valid = torch.clamp(total_valid, min=1)
+            total_loss = self._loss_fn.compute_cross_entropy(logits2d, labels1d)
+            return total_loss / total_valid
+
+    def _compute_entropy_cp_safe(
+        self,
+        logits: Union[List[torch.Tensor], torch.Tensor],
+        labels: torch.Tensor,
+        ent_weight: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Entropy computation aligned with logits chunk sizes (CP-safe).
+
+        Mirrors CEWithChunkedOutputLoss.compute_entropy but splits labels using
+        actual logits chunk lengths. Returns the same four-tensor tuple.
+        """
+        # Normalize inputs to a list of chunks
+        if not isinstance(logits, list):
+            logits = [logits]
+        chunk_lengths = [t.size(1) for t in logits]
+        total_T = sum(chunk_lengths)
+
+        # Align labels length with total logits length
+        if labels.size(1) != total_T:
+            ignore_idx = self._loss_fn.ignore_index
+            if labels.size(1) > total_T:
+                labels = labels[:, :total_T]
+            else:
+                pad = total_T - labels.size(1)
+                labels = F.pad(labels, (0, pad), value=ignore_idx)
+
+        label_chunks_2d = torch.split(labels, chunk_lengths, dim=1)
+
+        per_token_entropy_sum = labels.new_zeros((), dtype=torch.float32)
+        full_token_entropy_sum = labels.new_zeros((), dtype=torch.float32)
+        per_token_entropy_mean = labels.new_zeros((), dtype=torch.float32)
+        full_token_entropy_mean = labels.new_zeros((), dtype=torch.float32)
+
+        chunk_count = 0
+        valid_token_count = 0
+        epsilon = 1e-10
+        ignore_idx = self._loss_fn.ignore_index
+
+        for logit, l2d in zip(logits, label_chunks_2d):
+            log_probs = F.log_softmax(logit.reshape(-1, logit.size(-1)), dim=-1)
+            l1d = l2d.reshape(-1)
+            valid_mask = l1d != ignore_idx
+            valid_tokens_in_chunk = valid_mask.sum()
+            if valid_tokens_in_chunk == 0:
+                continue
+
+            chunk_count += 1
+            valid_token_count += valid_tokens_in_chunk
+
+            vocab_size = log_probs.size(-1)
+            valid_indices = l1d.clamp(0, vocab_size - 1)
+            gathered_log_probs = torch.gather(
+                log_probs, dim=-1, index=valid_indices.unsqueeze(-1)
+            ).squeeze(-1)
+            gathered_probs = gathered_log_probs.exp() + epsilon
+
+            # Per-token metrics (detach sums/means)
+            with torch.no_grad():
+                per_token_ent = -gathered_probs * gathered_log_probs
+                per_token_ent_masked = per_token_ent * valid_mask
+                per_token_entropy_sum += per_token_ent_masked.sum().detach()
+                per_token_entropy_mean += (
+                    per_token_ent_masked.sum() / valid_tokens_in_chunk
+                ).detach()
+
+            # Full-token entropy across vocab
+            if ent_weight > 0:
+                ungathered_probs = log_probs.exp() + epsilon
+                full_token_ent = -ungathered_probs * log_probs
+                valid_mask_expanded = valid_mask.unsqueeze(-1)
+                full_token_ent_masked = full_token_ent * valid_mask_expanded
+                full_token_entropy_mean += (
+                    full_token_ent_masked.sum() / valid_tokens_in_chunk
+                ) / len(logits)
+            else:
+                with torch.no_grad():
+                    ungathered_probs = log_probs.exp() + epsilon
+                    full_token_ent = -ungathered_probs * log_probs
+                    valid_mask_expanded = valid_mask.unsqueeze(-1)
+                    full_token_ent_masked = full_token_ent * valid_mask_expanded
+                    full_token_entropy_mean += (
+                        full_token_ent_masked.sum() / valid_tokens_in_chunk
+                    ) / len(logits)
+
+            with torch.no_grad():
+                full_token_entropy_sum += full_token_ent_masked.sum().detach()
+
+            # Cleanup per-chunk temporaries
+            del (
+                log_probs,
+                valid_indices,
+                gathered_log_probs,
+                gathered_probs,
+                ungathered_probs,
+                full_token_ent,
+                full_token_ent_masked,
+                per_token_ent,
+                per_token_ent_masked,
+            )
+
+        if chunk_count > 0:
+            per_token_entropy_mean = per_token_entropy_mean / chunk_count
+
+        return (
+            per_token_entropy_sum,
+            full_token_entropy_sum,
+            per_token_entropy_mean,
+            full_token_entropy_mean,
+        )
 
     # NOTE: added by us
     def _skip_max_seq_len_samples(self, batch: Dict[str, torch.Tensor]) -> bool:
@@ -1239,10 +1530,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                             continue
 
                         utils.batch_to_device(batch, self._device)
-                        # try:
-
+                        # Only pass sequence-shaped buffers to CP (exclude reward, scalars, etc.)
+                        cp_buffers = self._select_cp_buffers(batch)
                         with self.train_context(
-                            self.context_parallel_manager(list(batch.values()))):
+                            self.context_parallel_manager(cp_buffers)
+                        ):
                             if self.method == "reinforce":
                                 rewards = batch.pop("reward")
                             val_loss = self._loss_step(batch)
@@ -1261,6 +1553,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                                 self._max_validation_steps is not None
                                 and idx == self._max_validation_steps
                             ):
+                                mean_val_loss = cum_val_loss / (
+                                    idx + 1 - max_len_samples
+                                )
                                 break
 
                         mean_val_loss = cum_val_loss / (idx + 1 - max_len_samples)
@@ -1331,9 +1626,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Calculate the number of unmasked tokens in the current batch
                 # and increment the total number of tokens seen in the step
 
-
                 with self.train_context(
-                    self.context_parallel_manager(list(batch.values()))
+                    self.context_parallel_manager(self._select_cp_buffers(batch))
                 ):
                     current_num_tokens = (
                         batch["labels"] != self._loss_fn.ignore_index
@@ -1355,7 +1649,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         if self.divide_logits_with_temp:
 
                             if isinstance(logits, list):
-                                logits = [logit / self.sampling_temperature for logit in logits]
+                                logits = [
+                                    logit / self.sampling_temperature
+                                    for logit in logits
+                                ]
                     # calculate the entropy of the models responses
 
                     # Shift labels to compute loss
@@ -1365,15 +1662,15 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         (labels[..., 1:], self.ignore_labels_cache[: labels.shape[0]])
                     )
                     if not isinstance(logits, list):
-                        labels = labels.reshape(-1)
-                        logits = logits.reshape(-1, logits.size(-1))
+                        pass  # handled in CP-safe CE helper
 
                     # Compute loss
                     # Loss is normalized by default so we multiply by the number of tokens
                     # This way we can normalize by the total number of tokens if we're accumulating gradients
-
                     combined_loss = (
-                        self._loss_fn(logits, labels) * current_num_tokens * reward
+                        self._compute_ce_cp_safe(logits, labels)
+                        * current_num_tokens
+                        * reward
                     )
                     # before you compute the entropy extract the single logit from the label
                     (
@@ -1381,22 +1678,29 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         full_token_entropy_sum,
                         per_token_entropy_mean,
                         full_token_entropy_mean,
-                    ) = self._loss_fn.compute_entropy(logits, labels,ent_weight = self.ent_weight)
+                    ) = self._compute_entropy_cp_safe(
+                        logits, labels, ent_weight=self.ent_weight
+                    )
 
                     # Update tracking with the correct variable names
                     running_per_token_ent_sum += per_token_entropy_sum.detach()
                     running_full_token_ent_sum += full_token_entropy_sum.detach()
                     running_per_token_ent_mean += per_token_entropy_mean.detach()
-                    
-                    del logits, per_token_entropy_sum,full_token_entropy_sum,per_token_entropy_mean
 
-                
+                    del (
+                        logits,
+                        per_token_entropy_sum,
+                        full_token_entropy_sum,
+                        per_token_entropy_mean,
+                    )
+
                     if self.ent_weight > 0:
-                        combined_loss = combined_loss + self.ent_weight * full_token_entropy_mean
+                        combined_loss = (
+                            combined_loss + self.ent_weight * full_token_entropy_mean
+                        )
                     running_full_token_ent_mean += full_token_entropy_mean.detach()
                     del full_token_entropy_mean
                     running_loss += combined_loss.detach()
-
 
                     # For optimizer in backward, we need to normalize before calling backward
                     # This case and gradient accumulation are mutually exclusive
@@ -1405,7 +1709,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         torch.distributed.all_reduce(running_loss)
                         combined_loss = combined_loss / num_tokens
                     combined_loss.backward()
-                del combined_loss
+                    del combined_loss
                 # Step with optimizer
                 if (idx + 1) % self._gradient_accumulation_steps == 0 or (
                     (idx + 1) == n_samples
@@ -1426,12 +1730,18 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         # scale grads by max_batchsize and real_batchsize
                         if self.max_bsize and (idx + 1) == n_samples:
                             # should be bsize/number of gpus
+                            scaler = torch.tensor(
+                                number_leftover_samples / self.max_bsize
+                                if number_leftover_samples > 0
+                                else n_samples / self.max_bsize
+                            )
+
                             training.scale_grads(
                                 self._model,
-                                torch.tensor(number_leftover_samples / self.max_bsize),
+                                scaler,
                             )
                             log.info(
-                                f"Scaling gradients by {number_leftover_samples/self.max_bsize} Original bsize = {number_leftover_samples}"
+                                f"Scaling gradients by {scaler} Original bsize = {number_leftover_samples}"
                             )
                         if self._clip_grad_norm is not None:
                             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1444,6 +1754,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                             import gc
+
                             gc.collect()
                             torch.cuda.synchronize()
 
@@ -1521,14 +1832,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     # Note that this is called within gradient accumulation block, hence
                     # will include multiple forward / backward passes if gradient accumulation > 1
                     self._profiler.step()
-                    
 
                 idx += 1  # NOTE: added by us
 
             self.epochs_run += 1
             self.save_checkpoint(epoch=curr_epoch)
             # Add after each epoch completes
-                
 
         self._profiler.stop()
 
@@ -1536,6 +1845,247 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         if self._is_rank_zero:
             self._metric_logger.close()
         destroy_process_group()
+
+    def _select_cp_buffers(self, batch: Dict[str, torch.Tensor]) -> list[torch.Tensor]:
+        """Return only tensors suitable for CP sharding along dim=1.
+
+        We determine a target time dimension T and include only known seq-aligned
+        tensors with size(1) == T. This avoids passing scalars (e.g., reward) or
+        unrelated tensors to the CP context.
+        """
+        tensors: list[torch.Tensor] = []
+        t_tokens = batch.get("tokens")
+        t_labels = batch.get("labels")
+        t_mask = batch.get("mask")
+        t_enc_mask = batch.get("encoder_mask")
+        t_input_pos = batch.get("input_pos")
+
+        def get_T() -> Optional[int]:
+            if isinstance(t_tokens, torch.Tensor) and t_tokens.dim() >= 2:
+                return t_tokens.size(1)
+            if isinstance(t_labels, torch.Tensor) and t_labels.dim() >= 2:
+                return t_labels.size(1)
+            if isinstance(t_enc_mask, torch.Tensor) and t_enc_mask.dim() >= 2:
+                return t_enc_mask.size(1)
+            if isinstance(t_mask, torch.Tensor) and t_mask.dim() >= 2:
+                return t_mask.size(1)
+            return None
+
+        T = get_T()
+        if T is None:
+            return tensors
+
+        # Helper to add if matches T along dim=1
+        def maybe_add(x: Optional[torch.Tensor]) -> None:
+            if isinstance(x, torch.Tensor) and x.dim() >= 2 and x.size(1) == T:
+                tensors.append(x)
+
+        maybe_add(t_tokens)
+        # Include labels so they are sharded identically to tokens; ensures CE alignment under CP
+        maybe_add(t_labels)
+        maybe_add(t_input_pos)
+        # Only include 2D masks aligned on (B, T); skip 3D causal masks (B, T, T)
+        if (
+            isinstance(t_mask, torch.Tensor)
+            and t_mask.dim() == 2
+            and t_mask.size(1) == T
+        ):
+            tensors.append(t_mask)
+        maybe_add(t_enc_mask)
+
+        return tensors
+
+    # ------------------------------------------------------------------
+    # Lightweight Context Parallel (CP) scaling test
+    # ------------------------------------------------------------------
+    def test_cp(
+        self,
+        start_tokens: int = 1000,
+        end_tokens: int = 20000,
+        step: int = 1000,
+        batch_size: Optional[int] = None,
+    ) -> None:
+        """Minimal CP capability test.
+
+        Runs forward+backward+optimizer step attempts over increasing sequence
+        lengths with CP first (padded to required multiple) then without CP.
+        Prints a success/OOM table; no memory stats or plots.
+        """
+        from contextlib import nullcontext
+
+        world_size, rank = utils.get_world_size_and_rank()
+        device = self._device
+
+        # Infer batch size if not provided
+        if batch_size is None:
+            bs_guess = getattr(self, "ignore_labels_cache", None)
+            batch_size = (
+                bs_guess.size(0)
+                if isinstance(bs_guess, torch.Tensor) and bs_guess.dim() > 0
+                else 1
+            )
+
+        if not hasattr(self, "_optimizer") or self._optimizer is None:
+            utils.log_rank_zero(log, "Optimizer not initialized; aborting test_cp.")
+            return
+
+        seq_lens = list(range(start_tokens, end_tokens + 1, step))
+        cp_enabled = getattr(self, "cp_degree", 1) > 1
+        required_multiple = (
+            2 * max(1, int(self.tp_degree)) * int(self.cp_degree) if cp_enabled else 1
+        )
+        adjusted_seq_lens: List[int] = []
+        for L in seq_lens:
+            if required_multiple > 1:
+                pad = (required_multiple - (L % required_multiple)) % required_multiple
+                adjusted_seq_lens.append(L + pad)
+            else:
+                adjusted_seq_lens.append(L)
+
+        vocab_size = getattr(self._tokenizer, "vocab_size", None)
+        if vocab_size is None:
+            try:
+                vocab_size = self._model.lm_head.weight.size(0)  # type: ignore[attr-defined]
+            except Exception:
+                vocab_size = 50257
+
+        disabled_cp_manager = None
+        if cp_enabled:
+            disabled_cp_manager = training.get_context_parallel_manager(
+                enabled=False,
+                rotate_method=self.context_parallel_rotate_method,
+                world_mesh=self.world_mesh,
+                model=self._model,
+            )
+
+        local_results: List[Tuple[str, int, int, str]] = (
+            []
+        )  # (mode, orig_L, used_L, status)
+        cp_oom_len: Optional[int] = None
+        no_cp_oom_len: Optional[int] = None
+
+        def run_one(length_used: int, orig_L: int, use_cp: bool) -> bool:
+            try:
+                toks = torch.randint(
+                    0,
+                    vocab_size,
+                    (batch_size, length_used),
+                    device=device,
+                    dtype=torch.long,
+                )
+                labels_full = toks.clone()
+                batch = {"tokens": toks, "labels": labels_full}
+                ctx_mgr = (
+                    self.context_parallel_manager(self._select_cp_buffers(batch))
+                    if use_cp
+                    else (
+                        disabled_cp_manager([])
+                        if disabled_cp_manager is not None
+                        else nullcontext()
+                    )
+                )
+
+                with self.train_context(ctx_mgr):
+                    loss = self._loss_step(
+                        {"tokens": batch["tokens"], "labels": batch["labels"]}
+                    )
+                    if use_cp:
+                        loss.backward()
+                if not use_cp:
+                    loss.backward()
+                if not self._optimizer_in_bwd:
+                    if self._clip_grad_norm is not None:
+                        try:
+                            torch.nn.utils.clip_grad_norm_(
+                                self._model.parameters(), float(self._clip_grad_norm)
+                            )
+                        except Exception:
+                            pass
+                    self._optimizer.step()
+                    self._optimizer.zero_grad(set_to_none=True)
+                del toks, labels_full, batch, loss
+                local_results.append(
+                    ("cp" if use_cp else "no_cp", orig_L, length_used, "OK")
+                )
+                return True
+            except torch.cuda.OutOfMemoryError:
+                if hasattr(self, "activations_handling_ctx") and hasattr(
+                    self.activations_handling_ctx, "tracker"
+                ):
+                    self.activations_handling_ctx.tracker.clear()
+                local_results.append(
+                    ("cp" if use_cp else "no_cp", orig_L, length_used, "OOM")
+                )
+                return False
+
+        if cp_enabled:
+            self._model.train()
+            if not self._optimizer_in_bwd:
+                self._optimizer.zero_grad(set_to_none=True)
+            for orig_L, adj_L in zip(seq_lens, adjusted_seq_lens):
+                if self.max_seq_len is not None and adj_L > self.max_seq_len:
+                    continue
+                if not run_one(adj_L, orig_L, use_cp=True):
+                    cp_oom_len = orig_L
+                    if rank == 0:
+                        log.info(f"CP OOM at seq_len {orig_L} (adj {adj_L})")
+                    break
+
+        if cp_enabled:
+            if not self._optimizer_in_bwd:
+                self._optimizer.zero_grad(set_to_none=True)
+            for orig_L in seq_lens:
+                if self.max_seq_len is not None and orig_L > self.max_seq_len:
+                    continue
+                if not run_one(orig_L, orig_L, use_cp=False):
+                    no_cp_oom_len = orig_L
+                    if rank == 0:
+                        log.info(f"No-CP OOM at seq_len {orig_L}")
+                    break
+
+        gathered: List[List[Tuple[str, int, int, str]]] = [None] * world_size  # type: ignore
+        try:
+            torch.distributed.all_gather_object(gathered, local_results)
+        except Exception:
+            gathered = [[r for r in local_results]]
+        if rank != 0:
+            return
+
+        flat: Dict[Tuple[str, int], Tuple[str, int, int, str]] = {}
+        for part in gathered:
+            if part is None:
+                continue
+            for row in part:
+                flat.setdefault((row[0], row[1]), row)
+        if not flat:
+            log.info("No CP test data collected.")
+            return
+
+        header = ["Mode", "Orig_L", "Used_L", "Status"]
+        rows_cp = [v for k, v in flat.items() if k[0] == "cp"]
+        rows_no = [v for k, v in flat.items() if k[0] == "no_cp"]
+        rows_cp.sort(key=lambda x: x[1])
+        rows_no.sort(key=lambda x: x[1])
+        rows_all = rows_cp + rows_no
+
+        def col_width(idx: int, title: str) -> int:
+            return max(len(title), max((len(str(r[idx])) for r in rows_all), default=0))
+
+        widths = [col_width(i, h) for i, h in enumerate(header)]
+        fmt = " | ".join(f"{{:{w}}}" for w in widths)
+        sep = "-+-".join("-" * w for w in widths)
+        lines = [fmt.format(*header), sep]
+        for r in rows_cp:
+            lines.append(fmt.format(r[0], r[1], r[2], r[3]))
+        if rows_cp and rows_no:
+            lines.append(sep)
+        for r in rows_no:
+            lines.append(fmt.format(r[0], r[1], r[2], r[3]))
+        if cp_oom_len is not None:
+            lines.append(f"First CP OOM at seq_len {cp_oom_len}.")
+        if no_cp_oom_len is not None:
+            lines.append(f"First no-CP OOM at seq_len {no_cp_oom_len}.")
+        utils.log_rank_zero(log, "\nCP capability test results:\n" + "\n".join(lines))
 
 
 @config.parse
@@ -1562,6 +2112,11 @@ def recipe_main(cfg: DictConfig) -> None:
 
     recipe = FullFinetuneRecipeDistributed(cfg=cfg)
     recipe.setup(cfg=cfg)
+    if cfg.get("test_cp", False):
+        # Run lightweight CP scaling test and exit
+        recipe.test_cp()
+        recipe.cleanup()
+        return
     recipe.train()
     recipe.cleanup()
 
