@@ -55,8 +55,9 @@ debug_enabled = os.environ.get("ENABLE_DEBUGPY", "0").lower() in ("1", "true", "
 
 debug_port = 5678
 
-
-if debug_enabled:
+world_size, rank = utils.get_world_size_and_rank()
+_is_rank_zero = rank == 0
+if debug_enabled and _is_rank_zero:
     # Allow remote connections
     debugpy.listen(("0.0.0.0", debug_port))
     print(f"🐞 Debugpy listening on port {debug_port}")
@@ -165,6 +166,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # extract information from output_dir
         path_parts = self._output_dir.split("/")
         self.method = cfg.get("method", "rft")
+        self.train_q_online = cfg.get("train_q_online", False)
         self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
         self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
         self.divide_logits_with_temp = cfg.get("divide_logits_with_temp", True)
@@ -191,8 +193,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.epoch = int(epoch_match.group(1) if epoch_match else "0")
         self.run_id = f"{date_part}_{run_name_part}"
         self.ent_weight = cfg.get("ent_weight", 0.0)
+        self.train_p = cfg.get("train_p", False)
+        self.train_p_online_with_q = cfg.get("train_p_online_with_q", False)
         self.apply_advantage_in_tune = cfg.get("apply_advantage_in_tune", False)
         self.use_importance_sampling = cfg.get("use_importance_sampling", False)
+        self.train_q_online_with_p = cfg.get("train_q_online_with_p", True)
         if self._log_peak_memory_stats and self._device.type != "cuda":
             log.info(
                 "log_peak_memory_stats was set to True, however, training does not use cuda. Setting log_peak_memory_stats=False."
@@ -411,6 +416,17 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 "Are you sure you passed in the right recipe checkpoint?"
             ) from e
 
+    def _load_ref_checkpoint(self, cfg_ref_checkpointer: DictConfig) -> dict[str, Any]:
+        """
+        Extract the reference model checkpoint state from file.
+        """
+        _ref_checkpointer = config.instantiate(
+            cfg_ref_checkpointer,
+            #   should_load_recipe_state=False
+        )
+        checkpoint_dict = _ref_checkpointer.load_checkpoint()
+        return checkpoint_dict[training.MODEL_KEY]
+    
     def load_model(self, cfg: DictConfig) -> None:
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
 
@@ -459,35 +475,18 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         break
             # log config with parameter override
             self._metric_logger.log_config(cfg)
-        checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
-
-        checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
-
         self._compile = cfg.get("compile", False)
-        self._model = self._setup_model(
-            cfg_model=cfg.model,
-            enable_activation_checkpointing=self._enable_activation_checkpointing,
-            enable_activation_offloading=self._enable_activation_offloading,
-            activation_offloading_use_streams=self._activation_offloading_use_streams,
-            custom_sharded_layers=cfg.get("custom_sharded_layers", None),
-            fsdp_cpu_offload=cfg.get("fsdp_cpu_offload", False),
-            reshard_after_forward=cfg.get("fsdp_reshard_after_forward", True),
-            model_state_dict=checkpoint_dict[training.MODEL_KEY],
-            ac_mode=cfg.get("ac_mode", None),
-            ac_option=cfg.get("ac_option", None),
-        )
 
-        # if cfg.ref_checkpointer.checkpoint_dir != "" and not cfg.train_p:
-        if False:
-            ref_checkpoint_dict = self.load_checkpoint(
-                cfg_checkpointer=cfg.ref_checkpointer
-            )
+        if (cfg.ref_checkpointer.checkpoint_dir is not None and cfg.ref_checkpointer.checkpoint_dir != "" and '/tmp/' not in cfg.ref_checkpointer.checkpoint_dir) and not self.train_p:
+            ref_checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.ref_checkpointer)
+            
 
             self.reference_set = True
             self._ref_model = self._setup_model(
                 cfg_model=cfg.model,
                 enable_activation_checkpointing=self._enable_activation_checkpointing,
                 enable_activation_offloading=self._enable_activation_offloading,
+                activation_offloading_use_streams=self._activation_offloading_use_streams,
                 custom_sharded_layers=cfg.get("custom_sharded_layers", None),
                 fsdp_cpu_offload=cfg.get("fsdp_cpu_offload", False),
                 reshard_after_forward=cfg.get("fsdp_reshard_after_forward", True),
@@ -495,8 +494,44 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ac_mode=cfg.get("ac_mode", None),
                 ac_option=cfg.get("ac_option", None),
             )
+
+            checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
+
+
+            self._model = self._setup_model(
+                cfg_model=cfg.model,
+                enable_activation_checkpointing=self._enable_activation_checkpointing,
+                enable_activation_offloading=self._enable_activation_offloading,
+                activation_offloading_use_streams=self._activation_offloading_use_streams,
+                custom_sharded_layers=cfg.get("custom_sharded_layers", None),
+                fsdp_cpu_offload=cfg.get("fsdp_cpu_offload", False),
+                reshard_after_forward=cfg.get("fsdp_reshard_after_forward", True),
+                model_state_dict=checkpoint_dict[training.MODEL_KEY],
+                ac_mode=cfg.get("ac_mode", None),
+                ac_option=cfg.get("ac_option", None),
+            )
+
         else:
+
+            checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
+
+
+            self._model = self._setup_model(
+                cfg_model=cfg.model,
+                enable_activation_checkpointing=self._enable_activation_checkpointing,
+                enable_activation_offloading=self._enable_activation_offloading,
+                activation_offloading_use_streams=self._activation_offloading_use_streams,
+                custom_sharded_layers=cfg.get("custom_sharded_layers", None),
+                fsdp_cpu_offload=cfg.get("fsdp_cpu_offload", False),
+                reshard_after_forward=cfg.get("fsdp_reshard_after_forward", True),
+                model_state_dict=checkpoint_dict[training.MODEL_KEY],
+                ac_mode=cfg.get("ac_mode", None),
+                ac_option=cfg.get("ac_option", None),
+            )
             self._ref_model = self._model
+
+
+        
 
         utils.log_rank_zero(log, "Model setup complete.")
 
@@ -547,9 +582,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 "collate_fn", "torchtune.data.padded_collate_reinforce"
             )
         elif self.method == "priv":
-            collate_name = cfg.get(
-                "collate_fn", "torchtune.data.padded_collate_privilege"
-            )
+            if self.train_q_online:
+                collate_name = cfg.get(
+                    "collate_fn", "torchtune.data.padded_collate_privilege_online"
+                )
+            else:
+                collate_name = cfg.get(
+                    "collate_fn", "torchtune.data.padded_collate_privilege"
+                )
         cfg.dataset["split"] = "train"  # NOTE: added by us
         self._sampler, self._dataloader = self._setup_data(
             cfg_dataset=cfg.dataset,
