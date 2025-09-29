@@ -278,6 +278,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             total_value_per_sample / num_tokens_per_sample,
             torch.zeros_like(total_value_per_sample),
         )
+
         return mean_value
 
     def _get_sample_log_probs_from_chunks(
@@ -351,10 +352,10 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         logits_q: Union[torch.Tensor, List[torch.Tensor]],
         labels_without_priv: torch.Tensor,
         labels_with_priv: torch.Tensor,
-        end_of_prompt_with_priv: torch.Tensor,
-        action_start_pos_with_priv: torch.Tensor,
-        end_of_prompt_without_priv: torch.Tensor,
-        action_start_pos_without_priv: torch.Tensor,
+        end_of_prompt_with_priv: Optional[torch.Tensor] = None,
+        action_start_pos_with_priv: Optional[torch.Tensor] = None,
+        end_of_prompt_without_priv: Optional[torch.Tensor] = None,
+        action_start_pos_without_priv: Optional[torch.Tensor] = None,
         return_logprobs: bool = False,
         action_end_pos_with_priv: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -404,27 +405,34 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         seq_len = labels_with_priv.shape[1]
         seq_without_priv = labels_without_priv.shape[1]
 
-        # Create masks to include only thought tokens for each sample in the batch
-        thought_mask_with_priv = torch.zeros(
-            (batch_size, seq_len), dtype=torch.bool, device=device
-        )
-        thought_mask_without_priv = torch.zeros(
-            (batch_size, seq_without_priv), dtype=torch.bool, device=device
-        )
+        # Build masks for KL region; if positions are not provided, use full sequence
+        if end_of_prompt_with_priv is None or action_start_pos_with_priv is None:
+            thought_mask_with_priv = torch.ones(
+                (batch_size, seq_len), dtype=torch.bool, device=device
+            )
+        else:
+            thought_mask_with_priv = torch.zeros(
+                (batch_size, seq_len), dtype=torch.bool, device=device
+            )
+            for i in range(batch_size):
+                start_with = end_of_prompt_with_priv[i].item()
+                end_with = action_start_pos_with_priv[i].item()
+                if start_with < end_with:
+                    thought_mask_with_priv[i, start_with:end_with] = True
 
-        # Apply thought masks for each sample
-        for i in range(batch_size):
-            # Include thought tokens for with privilege scenario
-            start_with = end_of_prompt_with_priv[i].item()
-            end_with = action_start_pos_with_priv[i].item()
-            if start_with < end_with:
-                thought_mask_with_priv[i, start_with:end_with] = True
-
-            # Include thought tokens for without privilege scenario
-            start_without = end_of_prompt_without_priv[i].item()
-            end_without = action_start_pos_without_priv[i].item()
-            if start_without < end_without:
-                thought_mask_without_priv[i, start_without:end_without] = True
+        if end_of_prompt_without_priv is None or action_start_pos_without_priv is None:
+            thought_mask_without_priv = torch.ones(
+                (batch_size, seq_without_priv), dtype=torch.bool, device=device
+            )
+        else:
+            thought_mask_without_priv = torch.zeros(
+                (batch_size, seq_without_priv), dtype=torch.bool, device=device
+            )
+            for i in range(batch_size):
+                start_without = end_of_prompt_without_priv[i].item()
+                end_without = action_start_pos_without_priv[i].item()
+                if start_without < end_without:
+                    thought_mask_without_priv[i, start_without:end_without] = True
 
         # Apply thought mask to validity masks
         valid_mask_priv = (
@@ -540,7 +548,254 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
         return scaled_rewards
 
-    def compute_rewards(
+    def compute_rewards(self, action_log_ps_as_reward: bool = False):
+        if self.train_q_online:
+            return self.compute_rewards_q_online(action_log_ps_as_reward)
+        else:
+            return self.compute_rewards_standard(action_log_ps_as_reward)
+
+    def compute_rewards_q_online(
+        self,
+        action_log_ps_as_reward: bool = False,
+    ) -> Tuple[
+        List[float],
+        List[float],
+        float,
+        float,
+        float,
+        Dict[str, List[float]],
+        List[float],
+    ]:
+        """
+        Computes rewards and advantages for each sample in the dataloader.
+        The reward combines the original reward with KL divergence penalty:
+        reward = original_reward - gamma * KL(thought_tokens)
+
+        KL divergence is computed on "thought" tokens (between prompt and action):
+        KL(p(thought | prompt_without_secret) || p(thought | prompt_with_secret))
+
+        This uses the Rao-Blackwellized estimator for KL divergence on thought tokens.
+        Advantages are calculated as reward - mean(rewards for the same goal).
+
+        Returns:
+            A tuple containing:
+            - A list of rewards for each sample (original + KL penalty).
+            - A list of advantages for each sample.
+            - Mean log probability of action tokens without privilege (p_y_g_zx_mean).
+            - Mean log probability of action tokens with privilege (q_y_g_xz_mean).
+            - Mean entropy of thought tokens with privilege (q_z_g_xy_mean).
+            - Dictionary of rewards grouped by goal.
+            - A list of KL divergences for each sample (thought tokens only).
+        """
+        self._model.eval()
+        all_rewards = []
+        all_goals = []
+        p_y_g_zx = []
+        q_z_g_xy = []  # This will now store entropy of thought tokens
+        q_y_g_xz = []  # This will store action log-probs with privilege
+        kls = []
+        dataloader = self._dataloader
+
+        # Clear previous reference logprobs cache and store detailed logprobs for importance sampling
+        self.reference_logprobs_cache = {}
+        self.reference_logprobs_cache_p = {}
+        # Also store batch info for matching during training
+        self.batch_info_cache = {} if self.use_importance_sampling else None
+        batch_idx = 0
+
+        # Track trajectory indices and steps for GRPO grouping
+        all_trajectory_indices: List[int] = []
+        all_steps: List[int] = []
+        for batch in tqdm(dataloader, desc="Computing Rewards"):
+            all_steps.append(batch.get("step", 0))
+            all_trajectory_indices.append(batch.get("trajectory_id", 0))
+            goals = batch.pop("goal", None)
+            _ = batch.pop("privileged_found", None)
+            reward = torch.tensor([batch.pop("reward")], device=self._device)
+
+            utils.batch_to_device(batch, self._device)
+
+            # Record trajectory indices and steps for grouping (move to CPU for list)
+
+            # with privilege
+            batch_with_priv = batch["with_privilege"]
+            labels_with_priv = batch_with_priv["labels"]
+            model_inputs_with_priv = {
+                k: v
+                for k, v in batch_with_priv.items()
+                if k
+                not in [
+                    "labels",
+                    "action_start_pos",
+                    "action_end_pos",
+                    "end_of_prompt",
+                    "mask",
+                    "attention_mask",
+                ]
+            }
+            with torch.no_grad():
+                logits_with_priv = self._model(**model_inputs_with_priv)
+                logits_with_priv = [
+                    logit / self.sampling_temperature for logit in logits_with_priv
+                ]
+
+            # without privilege
+            batch_without_priv = batch["without_privilege"]
+            labels_without_priv = batch_without_priv["labels"]
+            model_inputs_without_priv = {
+                k: v
+                for k, v in batch_without_priv.items()
+                if k
+                not in [
+                    "labels",
+                    "action_start_pos",
+                    "action_end_pos",
+                    "end_of_prompt",
+                    "mask",
+                    "attention_mask",
+                ]
+            }
+            with torch.no_grad():
+                logits_without_priv = self._ref_model(**model_inputs_without_priv)
+                logits_without_priv = [
+                    logit / self.sampling_temperature for logit in logits_without_priv
+                ]
+            labels_shifted_with_priv = torch.hstack(
+                (
+                    labels_with_priv[..., 1:],
+                    self.ignore_labels_cache[: labels_with_priv.shape[0]],
+                )
+            )
+            labels_shifted_without_priv = torch.hstack(
+                (
+                    labels_without_priv[..., 1:],
+                    self.ignore_labels_cache[: labels_without_priv.shape[0]],
+                )
+            )
+
+            # Compute KL divergence (positions optional; defaults to all non-ignored)
+            if self.use_importance_sampling:
+
+                ref_logprobs_chunks_q: List[torch.Tensor] = self._get_sample_log_probs(
+                    logits_with_priv,
+                    labels_shifted_with_priv,
+                    return_per_token=True,
+                )
+                self.reference_logprobs_cache[batch_idx] = ref_logprobs_chunks_q
+            # if (end_of_prompt_without_priv - action_start_pos_without_priv).item() == (end_of_prompt_without_priv - action_start_pos_without_priv).item():
+            try:
+                # Positions are optional: compute KL over all non-ignored labels if not provided
+                kl_divergence = self._compute_kl_divergence_rao_blackwellized_masked(
+                    logits_without_priv,
+                    logits_with_priv,
+                    labels_without_priv,
+                    labels_with_priv,
+                    None,
+                    None,
+                    None,
+                    None,
+                    return_logprobs=False,
+                )
+            except Exception as e:
+                kl_divergence = torch.tensor([1.0], device=self._device)
+
+            rewards = reward - self.gamma * kl_divergence
+
+            # q_y_g_xz.extend(action_log_prob_with_privilege.detach().cpu().tolist())
+            # q_z_g_xy.extend(thought_entropy_with_privilege.detach().cpu().tolist())
+            # p_y_g_zx.extend(action_log_prob_without_privilege.detach().cpu().tolist())
+            all_rewards.extend(rewards.cpu().tolist())
+            all_goals.extend(goals)
+            # Store KL divergence (thought tokens) for logging
+            if not action_log_ps_as_reward:
+                kls.extend(kl_divergence.cpu().tolist())
+
+            batch_idx += 1
+        rewards = rescale_rewards(all_rewards)
+        # Group rewards by goal
+        rewards_by_goal = {}
+        for goal, reward in zip(all_goals, all_rewards):
+            if goal not in rewards_by_goal:
+                rewards_by_goal[goal] = []
+            rewards_by_goal[goal].append(reward)
+
+        # GRPO: group-relative advantages by (goal, step) aggregating (trajectory_id, reward)
+        rewards_by_goal_step: Dict[str, Dict[int, List[Tuple[int, float]]]] = (
+            defaultdict(lambda: defaultdict(list))
+        )
+        for g_, tid, stp, r in zip(
+            all_goals, all_trajectory_indices, all_steps, all_rewards
+        ):
+            rewards_by_goal_step[g_][int(stp)].append((int(tid), float(r)))
+
+        # Calculate advantages per sample relative to its (goal, step) group
+        advantages: List[float] = []
+        if not all_rewards:
+            advantages = []
+        else:
+            for g_, tid, stp, r in zip(
+                all_goals, all_trajectory_indices, all_steps, all_rewards
+            ):
+                grp = rewards_by_goal_step[g_][int(stp)]
+                if len(grp) > 1:
+                    mean_r = float(np.mean([rv for _, rv in grp]))
+                    advantages.append(r - mean_r)
+                else:
+                    # Single sample in group: use reward directly to avoid zero advantage
+                    advantages.append(r)
+
+        # Apply control variate flip if enabled
+        if self.flip_reward_control_variate:
+            log.info("Applying control variate to flip reward signs")
+            original_rewards = all_rewards.copy()  # Keep original for logging
+            all_rewards = self._apply_control_variate_flip(all_rewards)
+
+            # Recalculate rewards_by_goal_step with flipped rewards
+            rewards_by_goal_step = defaultdict(lambda: defaultdict(list))
+            for g_, tid, stp, reward in zip(
+                all_goals, all_trajectory_indices, all_steps, all_rewards
+            ):
+                rewards_by_goal_step[g_][int(stp)].append((int(tid), float(reward)))
+
+            # Recalculate advantages with flipped rewards using (goal, step) grouping
+            advantages = []
+            for g_, tid, stp, reward in zip(
+                all_goals, all_trajectory_indices, all_steps, all_rewards
+            ):
+                grp = rewards_by_goal_step[g_][int(stp)]
+                if len(grp) > 1:
+                    mean_r = float(np.mean([rv for _, rv in grp]))
+                    advantages.append(reward - mean_r)
+                else:
+                    advantages.append(reward)
+
+            log.info(
+                f"Original reward range: [{min(original_rewards):.4f}, {max(original_rewards):.4f}]"
+            )
+            log.info(
+                f"Flipped reward range: [{min(all_rewards):.4f}, {max(all_rewards):.4f}]"
+            )
+
+        p_y_g_xz_mean = np.mean(p_y_g_zx)
+        q_y_g_xz_mean = np.mean(q_y_g_xz)
+        q_z_g_xy_mean = np.mean(q_z_g_xy)
+
+        self._model.train()
+        if self.reference_set:
+            del self._ref_model
+
+        return (
+            all_rewards,
+            advantages,
+            p_y_g_xz_mean,
+            q_y_g_xz_mean,
+            q_z_g_xy_mean,
+            rewards_by_goal,
+            kls,
+            p_y_g_zx,
+        )
+
+    def compute_rewards_offline(
         self,
         action_log_ps_as_reward: bool = False,
     ) -> Tuple[
@@ -643,6 +898,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     "action_end_pos",
                     "end_of_prompt",
                     "mask",
+                    "attention_mask",
                 ]
             }
             with torch.no_grad():
@@ -664,6 +920,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     "action_end_pos",
                     "end_of_prompt",
                     "mask",
+                    "attention_mask",
                 ]
             }
             with torch.no_grad():
@@ -708,18 +965,21 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     return_per_token=True,
                 )
                 self.reference_logprobs_cache[batch_idx] = ref_logprobs_chunks_q
-
-            kl_divergence = self._compute_kl_divergence_rao_blackwellized_masked(
-                logits_without_priv,
-                logits_with_priv,
-                labels_without_priv,
-                labels_with_priv,
-                end_of_prompt_with_priv,
-                action_start_pos_with_priv,
-                end_of_prompt_without_priv,
-                action_start_pos_without_priv,
-                return_logprobs=False,
-            )
+            # if (end_of_prompt_without_priv - action_start_pos_without_priv).item() == (end_of_prompt_without_priv - action_start_pos_without_priv).item():
+            try:
+                kl_divergence = self._compute_kl_divergence_rao_blackwellized_masked(
+                    logits_without_priv,
+                    logits_with_priv,
+                    labels_without_priv,
+                    labels_with_priv,
+                    end_of_prompt_with_priv,
+                    action_start_pos_with_priv,
+                    end_of_prompt_without_priv,
+                    action_start_pos_without_priv,
+                    return_logprobs=False,
+                )
+            except Exception as e:
+                kl_divergence = torch.tensor([1.0], device=self._device)
 
             # Compute entropy of thought tokens for the privileged model
             thought_entropy_with_privilege = self._get_sample_log_probs(
@@ -733,6 +993,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             # Use KL divergence as rewards with gamma weighting
             if action_log_ps_as_reward:
                 rewards = reward + action_log_prob_without_privilege
+                # rewards = action_log_prob_without_privilege
             else:
                 rewards = reward + (
                     torch.clamp(action_log_prob_without_privilege, min=-1.0)
@@ -756,7 +1017,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             all_rewards.extend(rewards.cpu().tolist())
             all_goals.extend(goals)
             # Store KL divergence (thought tokens) for logging
-            kls.extend(kl_divergence.cpu().tolist())
+            if not action_log_ps_as_reward:
+                kls.extend(kl_divergence.cpu().tolist())
 
             batch_idx += 1
         rewards = rescale_rewards(all_rewards)
@@ -844,7 +1106,19 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         )
 
     def train(self) -> None:
-        if self.to_train_quiet_p:
+        if self.train_q_online:
+            log.info("=" * 50)
+            log.info("=" * 50)
+            log.info("=" * 50)
+            log.info("Training Q model online with and also P model")
+            log.info("=" * 50)
+            log.info("=" * 50)
+            log.info("=" * 50)
+            self.train_q_online_run(
+                train_q=self.train_q_online_with_p, train_p=self.train_p_online_with_q
+            )
+
+        elif self.to_train_quiet_p:
             log.info("=" * 50)
             log.info("=" * 50)
             log.info("=" * 50)
@@ -963,6 +1237,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                                 "action_end_pos",
                                 "end_of_prompt",
                                 "mask",
+                                "attention_mask",
                             ]
                         }
                         with self.activations_handling_ctx and torch.no_grad():
@@ -1001,6 +1276,15 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             running_full_token_ent_sum = 0
             running_per_token_ent_mean = 0
             running_full_token_ent_mean = 0
+            # Track per-step and running stats for tokens
+            running_bprop_tokens_sum = 0.0
+            running_bprop_tokens_min = float("inf")
+            running_bprop_tokens_max = 0.0
+            running_bprop_tokens_count = 0
+            running_total_tokens_sum = 0.0
+            running_total_tokens_min = float("inf")
+            running_total_tokens_max = 0.0
+            running_total_tokens_count = 0
             self._model.train()  # NOTE: added by us
 
             pbar = tqdm(
@@ -1051,7 +1335,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 num_tokens += current_num_tokens
                 # NOTE: added by us
                 # let's monitor the total number of tokens
-                real_num_tokens = train_batch["labels"].numel()
+                # Accumulate total tokens across microbatches in this step
+                real_num_tokens += train_batch["labels"].numel()
 
                 # Shape [b, s], needed for the loss not the model
                 labels = train_batch.pop("labels")
@@ -1059,6 +1344,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 train_batch.pop("action_end_pos", None)
                 train_batch.pop("end_of_prompt", None)
                 train_batch.pop("mask", None)
+                train_batch.pop("attention_mask", None)
 
                 batch_size = labels.shape[0]
 
@@ -1101,17 +1387,21 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                         reward_val = torch.tensor([1.0], device=self._device)
                     else:
                         reward_val = rewards_vec.to(self._device).view(-1)[:1]
-                    combined_loss = self._loss_fn(
-                        logits=loss_logits,
-                        labels=labels_shifted,
-                        reward=reward_val,
-                        ref_logprobs=ref_logprobs_for_loss,
-                        epsilon_low=self.epsilon_low_neg,
-                        epsilon_high=self.epsilon_high_pos,
-                    ).squeeze(0)
+                    combined_loss = (
+                        self._loss_fn(
+                            logits=loss_logits,
+                            labels=labels_shifted,
+                            reward=reward_val,
+                            ref_logprobs=ref_logprobs_for_loss,
+                            epsilon_low=self.epsilon_low_neg,
+                            epsilon_high=self.epsilon_high_pos,
+                        ).squeeze(0)
+                        * current_num_tokens
+                    )
                 else:
-                    combined_loss = self._loss_fn(
-                        logits=loss_logits, labels=labels_shifted
+                    combined_loss = (
+                        self._loss_fn(logits=loss_logits, labels=labels_shifted)
+                        * current_num_tokens
                     )
                 if use_rl:
                     log.info(f"Using RL loss at idx {idx} for sample {j}")
@@ -1186,6 +1476,36 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                         self._lr_scheduler.step()
 
                     loss_to_log = running_loss.item() / num_tokens
+                    # Update running stats for tokens using this step's totals
+                    bprop_tokens_this_step = float(num_tokens.item())
+                    total_tokens_this_step = float(real_num_tokens)
+                    running_bprop_tokens_sum += bprop_tokens_this_step
+                    running_bprop_tokens_min = min(
+                        running_bprop_tokens_min, bprop_tokens_this_step
+                    )
+                    running_bprop_tokens_max = max(
+                        running_bprop_tokens_max, bprop_tokens_this_step
+                    )
+                    running_bprop_tokens_count += 1
+                    running_total_tokens_sum += total_tokens_this_step
+                    running_total_tokens_min = min(
+                        running_total_tokens_min, total_tokens_this_step
+                    )
+                    running_total_tokens_max = max(
+                        running_total_tokens_max, total_tokens_this_step
+                    )
+                    running_total_tokens_count += 1
+                    # Compute running averages
+                    bprop_tokens_avg = (
+                        running_bprop_tokens_sum / running_bprop_tokens_count
+                        if running_bprop_tokens_count > 0
+                        else 0.0
+                    )
+                    total_tokens_avg = (
+                        running_total_tokens_sum / running_total_tokens_count
+                        if running_total_tokens_count > 0
+                        else 0.0
+                    )
                     pbar.update(1)
                     pbar.set_description(
                         f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
@@ -1205,6 +1525,13 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                             ),
                             "tokens_per_second_per_gpu": real_num_tokens
                             / (time_per_step * world_size),
+                            # Token stats (per local step)
+                            "bprop_tokens_avg": bprop_tokens_avg,
+                            "bprop_tokens_min": running_bprop_tokens_min,
+                            "bprop_tokens_max": running_bprop_tokens_max,
+                            "total_tokens_avg": total_tokens_avg,
+                            "total_tokens_min": running_total_tokens_min,
+                            "total_tokens_max": running_total_tokens_max,
                         }
                         # Add gradient norm stats to logging
                         log_dict.update(grad_norm_stats)
@@ -1378,6 +1705,15 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             running_full_token_ent_sum = 0
             running_per_token_ent_mean = 0
             running_full_token_ent_mean = 0
+            # Track per-step and running stats for tokens
+            running_bprop_tokens_sum = 0.0
+            running_bprop_tokens_min = float("inf")
+            running_bprop_tokens_max = 0.0
+            running_bprop_tokens_count = 0
+            running_total_tokens_sum = 0.0
+            running_total_tokens_min = float("inf")
+            running_total_tokens_max = 0.0
+            running_total_tokens_count = 0
             self._model.train()  # NOTE: added by us
 
             pbar = tqdm(
@@ -1430,7 +1766,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 num_tokens += current_num_tokens
                 # NOTE: added by us
                 # let's monitor the total number of tokens
-                real_num_tokens = train_batch["labels"].numel()
+                # Accumulate total tokens across microbatches in this step
+                real_num_tokens += train_batch["labels"].numel()
 
                 # Shape [b, s], needed for the loss not the model
                 labels = train_batch.pop("labels")
@@ -1438,10 +1775,14 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 train_batch.pop("action_end_pos", None)
                 train_batch.pop("end_of_prompt", None)
                 train_batch.pop("mask", None)
+                train_batch.pop("attention_mask", None)
 
                 batch_size = labels.shape[0]
                 advantages = all_advantages[j]
                 advantages = torch.tensor(advantages, device=self._device)
+
+                # Check if we should skip forward and backward pass for zero rewards
+                skip_computation = torch.all(advantages == 0)
 
                 # Build shifted labels once
                 labels_shifted = torch.hstack(
@@ -1453,6 +1794,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
                 # Importance sampling: use cached per-token ref logprobs from compute_rewards
                 ref_logprobs_for_loss = None
+
                 if self.use_importance_sampling:
 
                     ref_cached = self.reference_logprobs_cache.get(j)
@@ -1460,7 +1802,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                         n_chunks = len(ref_cached)
                         # ref_logprobs_for_loss = torch.cat(ref_cached,dim=1)[:,:action_start_pos].chunk(n_chunks, dim=1)
                         ref_logprobs_for_loss = ref_cached
-                processed_samples += batch_size
+
                 with self.activations_handling_ctx:
                     logits = self._model(**train_batch)
 
@@ -1472,17 +1814,22 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     labels = labels.reshape(-1)
                     logits = logits.reshape(-1, logits.size(-1))
 
+                # index for labels of the cot only
+
                 # logits = index_chunkced(logits,  action_start_pos)
                 # labels = labels[:, :action_start_pos]
 
-                combined_loss = self._loss_fn(
-                    logits=logits,
-                    labels=labels,
-                    reward=advantages,
-                    ref_logprobs=ref_logprobs_for_loss,
-                    # Provide PPO bounds (low<1, high>1) to enable masking inside the loss
-                    epsilon_low=self.epsilon_low_neg,
-                    epsilon_high=self.epsilon_high_pos,
+                combined_loss = (
+                    self._loss_fn(
+                        logits=logits,
+                        labels=labels,
+                        reward=advantages,
+                        ref_logprobs=ref_logprobs_for_loss,
+                        # Provide PPO bounds (low<1, high>1) to enable masking inside the loss
+                        epsilon_low=self.epsilon_low_neg,
+                        epsilon_high=self.epsilon_high_pos,
+                    )
+                    * current_num_tokens
                 )
                 running_loss += combined_loss.detach() * batch_size
 
@@ -1494,6 +1841,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     combined_loss = combined_loss / num_tokens
                 combined_loss.backward()
                 del combined_loss
+
+                processed_samples += batch_size
                 # Step with optimizer
                 if (idx + 1) % self._gradient_accumulation_steps == 0 or (
                     (idx + 1) == n_samples
@@ -1561,6 +1910,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     )
                     n_samples
                     # Log per-step metrics
+
                     if self._is_rank_zero:
                         time_per_step = time.perf_counter() - t0
                         log_dict = {
@@ -1574,6 +1924,703 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                             ),
                             "tokens_per_second_per_gpu": real_num_tokens  # NOTE: added by us
                             / (time_per_step * world_size),
+                            "q_y_g_xz_mean": q_y_g_xz_mean,
+                            "q_z_g_xy_mean": q_z_g_xy_mean,
+                            "p_y_g_zx_mean": p_y_g_zx_mean,
+                        }
+                        # Add gradient norm stats to logging
+                        log_dict.update(grad_norm_stats)
+                        if self._log_peak_memory_stats:
+                            log_dict.update(
+                                training.get_memory_stats(device=self._device)
+                            )
+                        if self._clip_grad_norm is not None:
+                            log_dict.update({"grad_norm": grad_norm})
+                        self._metric_logger.log_dict(
+                            log_dict,
+                            step=self.global_step,
+                        )
+
+                    # Reset running stats for the next step
+                    running_loss = 0
+                    combined_loss = 0
+                    num_tokens = 0
+                    real_num_tokens = 0
+                    running_per_token_ent_sum = 0
+                    running_full_token_ent_sum = 0
+                    running_per_token_ent_mean = 0
+                    running_full_token_ent_mean = 0
+                    t0 = time.perf_counter()
+
+                    # Stop tracking CUDA memory now that active steps are complete
+                    if (
+                        self._is_rank_zero
+                        and curr_epoch == 0
+                        and self.profiler_profile_memory
+                        and idx
+                        == self.profiler_wait_steps
+                        + self.profiler_warmup_steps
+                        + self.profiler_active_steps
+                    ):
+                        torch.cuda.memory._record_memory_history(enabled=None)
+
+                    # Step profiler
+                    # Note that this is called within gradient accumulation block, hence
+                    # will include multiple forward / backward passes if gradient accumulation > 1
+                    self._profiler.step()
+
+                idx += 1  # NOTE: added by us
+
+            self.epochs_run += 1
+            self.save_checkpoint(epoch=curr_epoch)
+            # Add after each epoch completes
+            if self._is_rank_zero and self.profiler_profile_memory:
+                torch.cuda.memory._dump_snapshot(
+                    f"memory_snapshot_epoch_{curr_epoch}.pickle"
+                )
+                torch.cuda.memory._record_memory_history(enabled=None)
+
+        self._profiler.stop()
+
+    def process_logits_memory_efficient(self, logits, labels, ignore_index):
+        """Memory-efficient logits processing that minimizes copies"""
+        if isinstance(logits, list):
+            # Process chunks sequentially to minimize peak memory
+            all_valid_logits = []
+            all_valid_labels = []
+
+            labels_chunks = labels.chunk(len(logits), dim=1)
+
+            for i, (logit_chunk, label_chunk) in enumerate(zip(logits, labels_chunks)):
+                # Process one chunk at a time
+                logit_2d = logit_chunk.view(-1, logit_chunk.size(-1))
+                label_1d = label_chunk.view(-1)
+
+                # Get valid mask
+                valid_mask = label_1d != ignore_index
+
+                if valid_mask.any():
+                    # Use the most memory-efficient selection
+                    all_valid_logits.append(logit_2d[valid_mask])
+                    all_valid_labels.append(label_1d[valid_mask])
+
+                # Free intermediate tensors immediately
+                del logit_2d, label_1d, valid_mask
+
+            if all_valid_logits:
+                concatenated_logits = torch.cat(all_valid_logits, dim=0)
+                concatenated_labels = torch.cat(all_valid_labels, dim=0)
+
+                # Re-chunk if originally was a list
+                original_chunks = len(logits)
+                chunk_size = (
+                    concatenated_logits.size(0) + original_chunks - 1
+                ) // original_chunks
+                rechunked_logits = list(concatenated_logits.split(chunk_size, dim=0))
+
+                return rechunked_logits, concatenated_labels.unsqueeze(0)
+            else:
+                return [], torch.empty(0, dtype=labels.dtype, device=labels.device)
+        else:
+            # Handle tensor case
+            logit_2d = logits.view(-1, logits.size(-1))
+            label_1d = labels.view(-1)
+            valid_mask = label_1d != ignore_index
+
+            if valid_mask.any():
+                return logit_2d[valid_mask], label_1d[valid_mask]
+            else:
+                return torch.empty(
+                    (0, logits.size(-1)), dtype=logits.dtype, device=logits.device
+                ), torch.empty(0, dtype=labels.dtype, device=labels.device)
+
+    def calculate_ppo_clipped_importance_sampling(
+        self,
+        wp_priv_logits: List[torch.Tensor],
+        wop_logits: List[torch.Tensor],
+        labels: torch.Tensor,
+        labels_np: torch.Tensor,
+        advantages: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculate PPO-style clipped importance sampling ratios.
+        This version handles logits of different lengths by finding the intersection
+        of valid (non-ignored) tokens. This implementation is optimized for memory
+        by processing chunk-by-chunk.
+
+        Args:
+            wp_priv_logits (List[torch.Tensor]): Logits from the model with privilege (list of chunks).
+            wop_logits (List[torch.Tensor]): Logits from the model without privilege (list of chunks).
+            labels (torch.Tensor): Ground truth labels for the privileged model.
+            labels_np (torch.Tensor): Ground truth labels for the non-privileged model.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing the unclipped and clipped importance ratios (summed).
+        """
+        import torch.nn.functional as F
+
+        wp_selected_log_ps_list = []
+        wop_selected_log_ps_list = []
+
+        # Process each chunk individually to save memory
+        labels_chunks = labels.view(1, -1).chunk(len(wp_priv_logits), dim=1)
+        labels_np_chunks = labels_np.view(1, -1).chunk(len(wop_logits), dim=1)
+
+        for i, (wp_chunk, wop_chunk) in enumerate(zip(wp_priv_logits, wop_logits)):
+            # For each chunk, we expect labels to be 1D
+            labels_flat = labels_chunks[i].view(-1)
+            labels_np_flat = labels_np_chunks[i].view(-1)
+
+            # Find valid indices within the current chunk's scope
+            valid_mask_priv = labels_flat != self._loss_fn.ignore_index
+            valid_mask_wop = labels_np_flat != self._loss_fn.ignore_index
+
+            # Ensure we are comparing the same tokens
+            assert (
+                valid_mask_priv.sum() == valid_mask_wop.sum()
+            ), "Valid token counts do not match between privileged and non-privileged"
+
+            # Filter logits and labels for valid tokens
+            wp_logits_valid = wp_chunk[valid_mask_priv]
+            wop_logits_valid = wop_chunk[valid_mask_wop]
+            labels_valid = labels_flat[valid_mask_priv]
+
+            if labels_valid.numel() == 0:
+                continue
+
+            # Compute log softmax
+            wp_log_ps = F.log_softmax(wp_logits_valid, dim=-1)
+            wop_log_ps = F.log_softmax(wop_logits_valid, dim=-1)
+
+            # Gather log-probabilities for the correct tokens
+            vocab_size = wp_log_ps.size(-1)
+            valid_indices = labels_valid.clamp(0, vocab_size - 1).unsqueeze(-1)
+
+            wp_selected_log_ps = torch.gather(
+                wp_log_ps, dim=-1, index=valid_indices
+            ).squeeze(-1)
+            wop_selected_log_ps = torch.gather(
+                wop_log_ps, dim=-1, index=valid_indices
+            ).squeeze(-1)
+
+            wp_selected_log_ps_list.append(wp_selected_log_ps)
+            wop_selected_log_ps_list.append(wop_selected_log_ps)
+
+        # Concatenate results from all chunks
+        if not wp_selected_log_ps_list:
+            # Handle case with no valid tokens
+            return torch.tensor(0.0, device=wp_priv_logits[0].device), torch.tensor(
+                0.0, device=wp_priv_logits[0].device
+            )
+
+        wp_selected_log_ps_final = torch.cat(wp_selected_log_ps_list)
+        wop_selected_log_ps_final = torch.cat(wop_selected_log_ps_list)
+
+        # Calculate the importance ratio
+        ratio = torch.exp(wop_selected_log_ps_final - wp_selected_log_ps_final)
+
+        # Clip the ratio
+        clipped_ratio = torch.clamp(ratio, self.epsilon_low_neg, self.epsilon_high_pos)
+
+        policy_loss = -(torch.min(ratio, clipped_ratio))
+
+        del (
+            wp_selected_log_ps_final,
+            wop_selected_log_ps_final,
+            wp_selected_log_ps_list,
+            wop_selected_log_ps_list,
+            wp_logits_valid,
+            wop_logits_valid,
+            ratio,
+            clipped_ratio,
+        )
+        # Return summed ratios by default
+        return policy_loss.sum()
+
+    def train_q_online_run(self, train_q=True, train_p=False) -> None:
+        """
+        The core training loop.
+        """
+        # clean up before training begins
+        training.cleanup_before_training()
+
+        world_size, rank = training.get_world_size_and_rank()
+
+        # zero out the gradients before starting training
+        if not self._optimizer_in_bwd:
+            self._optimizer.zero_grad()
+        else:
+            for opt in self._optim_ckpt_wrapper.optim_map.values():
+                opt.zero_grad()
+
+        # Initialize tokens count and running loss (for grad accumulation)
+        t0 = time.perf_counter()
+        running_loss = 0
+        num_tokens = 0
+
+        # NOTE: added by us - sample just once at the beginning of the epoch loop
+        self._sampler.set_epoch(0)
+
+        self._profiler.start()
+        # self.epochs_run should be non-zero when we're resuming from a checkpoint
+        for curr_epoch in range(self.epochs_run, self.total_epochs):
+            # Update the sampler to ensure data is correctly shuffled across epochs
+            # in case shuffle is True
+            # NOTE: removing it from here and putting it before the epoch loop
+            # because our epochs are not the same as the dataloader epochs
+            for _sampler_validation in self._sampler_validation_list:
+                _sampler_validation.set_epoch(curr_epoch)  # NOTE: added by us
+
+            # NOTE: added by us
+            # ------ Validation Step ------ #
+            self._model.eval()
+            self._ref_model.eval()
+
+            with torch.no_grad():
+                for i, dataloader_validation in enumerate(
+                    self._dataloader_validation_list
+                ):
+                    for _, batch in enumerate(dataloader_validation):
+                        batch.pop("goal", None)
+                        batch.pop("privileged_found", None)
+                        utils.batch_to_device(batch, self._device)
+                        val_loss = torch.tensor(0.0, device=self._device)
+                        if self._is_rank_zero:
+                            self._metric_logger.log_dict(
+                                {f"val_loss_{i}": val_loss.item()},
+                                step=self.global_step,
+                            )
+            del val_loss
+            # ------ Reward and Advantage Computation ------ #
+            (
+                all_rewards,
+                all_advantages,
+                p_y_g_zx_mean,
+                q_y_g_xz_mean,
+                q_z_g_xy_mean,
+                rewards_by_goal,
+                kls,
+                p_y_g_zx_all,
+            ) = self.compute_rewards()
+
+            # TODO: This is hacky need a better way to do this but this will work for now
+            # I think the issue is that the advantages are
+            # Use advantages if apply_advantage_in_tune is True, otherwise use rewards
+            if self.apply_advantage_in_tune:
+                all_advantages = all_advantages  # Use computed advantages
+            else:
+                all_advantages = all_rewards  # Use rewards directly
+            # Log KL divergence statistics
+            if self._is_rank_zero:
+                kl_mean = np.mean(kls)
+                kl_std = np.std(kls)
+
+                log.info(
+                    f"KL Divergence Stats - Mean: {kl_mean:.4f}, Std: {kl_std:.4f}"
+                )
+
+                self._metric_logger.log_dict(
+                    {
+                        "kl_divergence_mean": kl_mean,
+                        "kl_divergence_std": kl_std,
+                        "reward_mean": np.mean(all_rewards),
+                        "reward_std": np.std(all_rewards),
+                    },
+                    step=self.global_step,
+                )
+
+            # ------ Training Epoch ------ #
+            # Initialize tokens count and running loss (for grad accumulation)
+            t0 = time.perf_counter()
+            running_loss = 0
+            num_tokens = 0
+            real_num_tokens = 0
+            max_len_samples = 0
+            # Update entropy tracking variables to include sum and mean metrics
+            running_per_token_ent_sum = 0
+            running_full_token_ent_sum = 0
+            running_per_token_ent_mean = 0
+            running_full_token_ent_mean = 0
+            # Track per-step and running stats for tokens
+            running_bprop_tokens_sum = 0.0
+            running_bprop_tokens_min = float("inf")
+            running_bprop_tokens_max = 0.0
+            running_bprop_tokens_count = 0
+            running_total_tokens_sum = 0.0
+            running_total_tokens_min = float("inf")
+            running_total_tokens_max = 0.0
+            running_total_tokens_count = 0
+            self._model.train()  # NOTE: added by us
+
+            pbar = tqdm(
+                total=self._steps_per_epoch, disable=not (rank == 0), desc="Training"
+            )
+
+            # NOTE: added by us - counter to account for samples that are too long
+            idx = 0
+            processed_samples = 0
+            n_samples = len(self._dataloader)
+            n_gpus = torch.distributed.get_world_size()
+            number_leftover_samples = (
+                n_samples * n_gpus
+            ) % self._gradient_accumulation_steps
+            agent_tokens_tracker = []
+            total_tokens_avg_tracker = []
+            pbar = tqdm(
+                total=self._steps_per_epoch, disable=not (rank == 0), desc="Training"
+            )
+            for j, batch in enumerate(self._dataloader):
+                if ((idx // self._gradient_accumulation_steps)) >= (
+                    self._steps_per_epoch
+                ) and not self.max_bsize:
+                    break
+                if j != processed_samples:
+                    log.warning(
+                        f"Skipping batch {j} as it does not match processed_samples {processed_samples}"
+                    )
+
+                train_batch = batch["with_privilege"]
+                train_batch_np = batch["without_privilege"]
+                if self._skip_max_seq_len_samples(
+                    train_batch
+                ) or self._skip_max_seq_len_samples(batch["without_privilege"]):
+                    max_len_samples += 1
+                    continue
+
+                # Start tracking CUDA memory for active steps for just the first epoch
+                if (
+                    self._is_rank_zero
+                    and curr_epoch == 0
+                    and self.profiler_profile_memory
+                    and idx == self.profiler_wait_steps + self.profiler_warmup_steps
+                ):
+                    torch.cuda.memory._record_memory_history()
+
+                batch.pop("goal", None)
+                batch.pop("privileged_found", None)
+                og_reward = batch.pop("og_reward", None)
+                utils.batch_to_device(batch, self._device)
+
+                # Calculate the number of unmasked tokens in the current batch
+                # and increment the total number of tokens seen in the step
+                current_num_tokens = (
+                    train_batch["labels"] != self._loss_fn.ignore_index
+                ).sum()
+                current_num_tokens_track = current_num_tokens.item()
+                # NOTE: added by us
+                # let's monitor the total number of tokens
+                # Accumulate total tokens across microbatches in this step
+                real_num_tokens += train_batch["labels"].numel()
+
+                # Shape [b, s], needed for the loss not the model
+                labels = train_batch.pop("labels")
+                action_start_pos = train_batch.pop("action_start_pos", None)
+                train_batch.pop("action_end_pos", None)
+                train_batch.pop("end_of_prompt", None)
+                train_batch.pop("mask", None)
+                train_batch.pop("attention_mask", None)
+
+                labels_np = train_batch_np.pop("labels")
+                action_start_pos_np = train_batch_np.pop("action_start_pos", None)
+                train_batch_np.pop("action_end_pos", None)
+                train_batch_np.pop("end_of_prompt", None)
+                train_batch_np.pop("mask", None)
+                train_batch_np.pop("attention_mask", None)
+                utils.batch_to_device(train_batch_np, self._device)
+
+                batch_size = labels.shape[0]
+                total_tokens_avg_tracker.append(real_num_tokens / batch_size)
+                agent_tokens_tracker.append(current_num_tokens_track / batch_size)
+                advantages = all_advantages[j]
+                advantages = torch.tensor(advantages, device=self._device)
+                rank = torch.distributed.get_rank()
+                # Check if we should skip forward and backward pass for zero rewards
+                skip_computation = og_reward == 0
+                num_tokens += (
+                    current_num_tokens if not train_p else current_num_tokens * 2
+                )
+
+                # Build shifted labels once
+                labels_shifted = torch.hstack(
+                    (
+                        labels[..., 1:],
+                        self.ignore_labels_cache[: labels.shape[0]],
+                    )
+                )
+                labels_shifted_np = torch.hstack(
+                    (
+                        labels_np[..., 1:],
+                        self.ignore_labels_cache[: labels_np.shape[0]],
+                    )
+                )
+
+                # Importance sampling: use cached per-token ref logprobs from compute_rewards
+                ref_logprobs_for_loss = None
+                if self.use_importance_sampling:
+
+                    ref_cached = self.reference_logprobs_cache.get(j)
+                    if ref_cached is not None:
+                        n_chunks = len(ref_cached)
+                        # ref_logprobs_for_loss = torch.cat(ref_cached,dim=1)[:,:action_start_pos].chunk(n_chunks, dim=1)
+                        ref_logprobs_for_loss = ref_cached
+
+                # Memory optimization: Sequential forward/backward passes
+                total_loss = torch.tensor(0.0, device=self._device, requires_grad=True)
+
+                # First forward pass: with privilege
+                with self.activations_handling_ctx:
+                    logits = self._model(**train_batch)
+
+                # Prepare labels for first loss
+                labels = labels_shifted
+
+                # Use memory-efficient processing
+                logits, labels = self.process_logits_memory_efficient(
+                    logits, labels, self._loss_fn.ignore_index
+                )
+
+                # First loss computation and backward pass
+                # Skip if there are no valid tokens to compute loss on
+
+                combined_loss = (
+                    self._loss_fn(
+                        logits=logits,
+                        labels=labels,
+                        reward=advantages,
+                        ref_logprobs=ref_logprobs_for_loss,
+                        # Provide PPO bounds (low<1, high>1) to enable masking inside the loss
+                        epsilon_low=self.epsilon_low_neg,
+                        epsilon_high=self.epsilon_high_pos,
+                    )
+                    * current_num_tokens
+                )
+                if train_p:
+
+                    logits_with_priv = (
+                        [l.clone().detach() for l in logits]
+                        if isinstance(logits, list)
+                        else logits.clone().detach()
+                    )
+                else:
+                    logits_with_priv = None
+                # Normalize and backward for first pass
+                if self._optimizer_in_bwd:
+                    torch.distributed.all_reduce(num_tokens)
+                    first_loss_normalized = combined_loss / num_tokens
+                else:
+                    first_loss_normalized = combined_loss
+
+                # Always call backward to satisfy activation offloading tracker
+                first_loss_normalized.backward()
+
+                # If not training Q, zero out the gradients immediately after backward
+                if not train_q:
+                    self._model.zero_grad(set_to_none=True)
+
+                total_loss = total_loss + combined_loss.detach()
+                if rank == 0:
+                    pbar.set_description(
+                        f"Sample {j+1}, Loss: {combined_loss.item():.4f}, Tokens: {current_num_tokens.item()}"
+                    )
+                # Clear first pass memory
+                allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+                # log.info(
+                #     f"CUDA Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB"
+                # )
+                del logits, combined_loss
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # Basic memory usage
+                allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+                log.info(
+                    f"CUDA Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB"
+                )
+                if train_p:
+                    # log.info("training_p")
+                    # Second forward pass: without privilege (always execute for distributed sync)
+                    with self.activations_handling_ctx:
+                        logits_np = self._model(**train_batch_np)
+
+                    # we always use batchsize of 1 extract logits where the labels are not -100
+
+                    # Prepare labels for second loss
+                    labels_np = labels_shifted_np
+
+                    # Use memory-efficient processing
+                    logits_np, labels_np = self.process_logits_memory_efficient(
+                        logits_np, labels_np, self._loss_fn.ignore_index
+                    )
+
+                    combined_loss_np = (
+                        self.calculate_ppo_clipped_importance_sampling(  # noqa: E501
+                            wp_priv_logits=(
+                                logits_with_priv
+                                if isinstance(logits_with_priv, list)
+                                else [logits_with_priv]
+                            ),  # noqa: E501
+                            wop_logits=(
+                                logits_np
+                                if isinstance(logits_np, list)
+                                else [logits_np]
+                            ),
+                            labels=labels,
+                            labels_np=labels_np,
+                            advantages=advantages,
+                        )
+                    )
+                    del logits_with_priv, labels
+                    # combined_loss_np = (
+                    #     self._loss_fn(
+                    #         logits=logits_np,
+                    #         labels=labels_np,
+                    #         reward=advantages,
+                    #         precomputed_importance_ratio=importance_ratio,
+                    #         # Note: no ref_logprobs or PPO bounds for NP model
+                    #     )
+                    #     * current_num_tokens
+                    # )
+
+                    # Apply skip computation by zeroing the loss instead of skipping
+                    # combined_loss_np = (
+                    #     combined_loss_np
+                    #     if not skip_computation
+                    #     else combined_loss_np * 0.0
+                    # )
+
+                    # Normalize and backward for second pass
+                    if self._optimizer_in_bwd:
+                        second_loss_normalized = combined_loss_np / num_tokens
+                    else:
+                        second_loss_normalized = combined_loss_np
+
+                    second_loss_normalized.backward()
+                    total_loss = total_loss + combined_loss_np.detach()
+
+                    log.info(
+                        f"Combined loss with np model {combined_loss_np.detach().item()}"
+                    )
+                    del (
+                        logits_np,
+                        combined_loss_np,
+                        labels_np,
+                        second_loss_normalized,
+                    )
+                else:
+                    del logits_with_priv
+
+                # Clear second pass memory
+                # Final memory cleanup
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # Update running loss with total from both passes
+                running_loss += total_loss * batch_size
+
+                # Handle distributed reduction for running_loss only (gradients already accumulated)
+                if self._optimizer_in_bwd:
+                    torch.distributed.all_reduce(running_loss)
+                # Final memory cleanup
+
+                del total_loss
+
+                processed_samples += batch_size
+                # Step with optimizer
+                if (idx + 1) % self._gradient_accumulation_steps == 0 or (
+                    (idx + 1) == n_samples
+                ):
+
+                    if not self._optimizer_in_bwd:
+                        # Get total number of tokens across all ranks to normalize gradients
+                        torch.distributed.all_reduce(num_tokens)
+                        # This will ensure that the logged loss matches what we're optimizing
+                        torch.distributed.all_reduce(running_loss)
+                        # All-reduce all entropy metrics
+
+                        # Manually scale the gradients from unnormalized loss by total # of tokens
+                        training.scale_grads(self._model, 1 / num_tokens)
+                        # scale grads by max_batchsize and real_batchsize
+                        if self.max_bsize and (idx + 1) == n_samples:
+                            if number_leftover_samples == 1:
+                                number_leftover_samples = n_samples
+                            scaler = torch.tensor(
+                                number_leftover_samples / self.max_bsize
+                                if number_leftover_samples > 0
+                                else n_samples / self.max_bsize
+                            )
+
+                            training.scale_grads(
+                                self._model,
+                                scaler,
+                            )
+                            log.info(
+                                f"Scaling gradients by {scaler} Original bsize = {number_leftover_samples}"
+                            )
+
+                        # Calculate gradient norms before clipping (efficient way)
+                        total_norm = torch.nn.utils.clip_grad_norm_(
+                            self._model.parameters(), max_norm=float("inf")
+                        )
+
+                        grad_norm_stats = {"grad_norm_total": total_norm.item()}
+
+                        if self._clip_grad_norm is not None:
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self._model.parameters(),
+                                max_norm=float(self._clip_grad_norm),
+                            )
+                        self._optimizer.step()
+                        log.info(f"optimizer step")
+                        self._optimizer.zero_grad(set_to_none=True)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                            gc.collect()
+                            torch.cuda.synchronize()
+
+                    # Update the number of steps when the weights are updated
+                    self.global_step += 1
+
+                    # Step the learning rate scheduler
+                    if self._lr_scheduler is not None:
+                        self._lr_scheduler.step()
+
+                    loss_to_log = running_loss.item() / num_tokens
+                    pbar.update(1)
+                    pbar.set_description(
+                        f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
+                    )
+                    n_samples
+                    # Log per-step metrics
+
+                    if self._is_rank_zero:
+                        agent_num_tokens_avg = (
+                            sum(agent_tokens_tracker) / len(agent_tokens_tracker)
+                            if len(agent_tokens_tracker) > 0
+                            else 0.0
+                        )
+                        total_num_tokens_avg = (
+                            sum(total_tokens_avg_tracker)
+                            / len(total_tokens_avg_tracker)
+                            if len(total_tokens_avg_tracker) > 0
+                            else 0.0
+                        )
+                        time_per_step = time.perf_counter() - t0
+                        log_dict = {
+                            "loss": loss_to_log.cpu().item(),
+                            "lr": get_lr(
+                                (
+                                    self._optimizer
+                                    if not self._optimizer_in_bwd
+                                    else self._optim_ckpt_wrapper
+                                ),
+                            ),
+                            "tokens_per_second_per_gpu": real_num_tokens  # NOTE: added by us
+                            / (time_per_step * world_size),
+                            "agent_num_tokens_avg": agent_num_tokens_avg,
+                            "total_num_tokens_avg": total_num_tokens_avg,
+                            # Token stats (per local step)
                             "q_y_g_xz_mean": q_y_g_xz_mean,
                             "q_z_g_xy_mean": q_z_g_xy_mean,
                             "p_y_g_zx_mean": p_y_g_zx_mean,
@@ -1802,6 +2849,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 train_batch.pop("action_end_pos", None)
                 train_batch.pop("end_of_prompt", None)
                 train_batch.pop("mask", None)
+                train_batch.pop("attention_mask", None)
                 batch_size = labels.shape[0]
                 advantages = all_advantages[j]
                 advantages = torch.tensor(advantages, device=self._device)
@@ -1928,6 +2976,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     )
                     n_samples
                     # Log per-step metrics
+
                     if self._is_rank_zero:
                         time_per_step = time.perf_counter() - t0
                         log_dict = {
@@ -2000,7 +3049,6 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         self._profiler.stop()
 
 
-
 def rescale_rewards(all_rewards):
     """
     Min-max scale a list of rewards to the range [-1, 1].
@@ -2021,7 +3069,6 @@ def rescale_rewards(all_rewards):
     scaled = [2.0 * ((float(r) - min_r) / denom) - 1.0 for r in all_rewards]
     # Clamp for numerical safety
     return [max(-1.0, min(1.0, s)) for s in scaled]
-
 
 
 def index_chunkced(chunked, index):
