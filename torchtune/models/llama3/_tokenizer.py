@@ -5,12 +5,22 @@
 # LICENSE file in the root directory of this source tree.
 
 import re
+import json
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from torchtune.data import Message, PromptTemplate, truncate
 from torchtune.modules.tokenizers import ModelTokenizer, TikTokenBaseTokenizer
 from torchtune.modules.transforms import Transform
 from torchtune.models.llama3._prompt_template import Llama3ChatTemplate
+
+try:
+    from tokenizers import Tokenizer as HFTokenizer
+
+    _HF_TOKENIZERS_AVAILABLE = True
+except ImportError:
+    _HF_TOKENIZERS_AVAILABLE = False
+    HFTokenizer = None
 
 
 CL100K_PATTERN = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""  # noqa
@@ -43,11 +53,11 @@ LLAMA3_SPECIAL_TOKENS = {**SPECIAL_TOKENS, **RESERVED_TOKENS}
 
 class Llama3Tokenizer(ModelTokenizer, Transform):
     """
-    tiktoken tokenizer configured with Llama3 Instruct's special tokens, as described in
-    https://llama.meta.com/docs/model-cards-and-prompt-formats/meta-llama-3
+    Universal Llama3 tokenizer that can load from either tiktoken or tokenizer.json format.
+    Automatically detects the format based on file extension or content.
 
     Args:
-        path (str): Path to pretrained tiktoken tokenizer file.
+        path (str): Path to pretrained tokenizer file. Can be tiktoken format or tokenizer.json.
         special_tokens (Optional[Dict[str, int]]): mapping containing special text tokens and
             their registered token IDs. If left as None, this will be set to the canonical
             Llama3 special tokens.
@@ -64,7 +74,14 @@ class Llama3Tokenizer(ModelTokenizer, Transform):
             The extra text will still get tokenized as normal text, not as special tokens. Default is None.
 
     Examples:
+        >>> # With tiktoken format
         >>> tokenizer = Llama3Tokenizer("/path/to/tt_model")
+        >>> tokenized_text = tokenizer.encode("Hello world!", add_bos=True, add_eos=True)
+        >>> print(tokenized_text)
+        [1, 31587, 29644, 102, 2]
+
+        >>> # With tokenizer.json format
+        >>> tokenizer = Llama3Tokenizer("/path/to/tokenizer.json")
         >>> tokenized_text = tokenizer.encode("Hello world!", add_bos=True, add_eos=True)
         >>> print(tokenized_text)
         [1, 31587, 29644, 102, 2]
@@ -83,26 +100,72 @@ class Llama3Tokenizer(ModelTokenizer, Transform):
 
         self._validate_special_tokens()
 
-        # Encode BOS and EOS, define pad ID
+        # Set up special token IDs
         self.bos_id = self.special_tokens["<|begin_of_text|>"]
         self.eos_id = self.special_tokens["<|end_of_text|>"]
         self.pad_id = self.special_tokens["<|finetune_right_pad_id|>"]
         self.step_id = self.special_tokens["<|step_id|>"]
-
-        # Encode extra special tokens
         self.start_header_id = self.special_tokens["<|start_header_id|>"]
         self.end_header_id = self.special_tokens["<|end_header_id|>"]
         self.eot_id = self.special_tokens["<|eot_id|>"]
-
         self.eom_id = self.special_tokens["<|eom_id|>"]
         self.python_tag = self.special_tokens["<|python_tag|>"]
-
-        # Media tokens
         self.image_id = self.special_tokens["<|image|>"]
 
         # During generation, stop when either eos_id, eot_id, or eom_id is encountered
         self.stop_tokens = [self.eos_id, self.eot_id, self.eom_id]
 
+        self.max_seq_len = max_seq_len
+        self.prompt_template = prompt_template
+
+        # Detect file format and initialize appropriate tokenizer
+        self._init_tokenizer(path)
+
+        # Regex for removing special tokens from the decoded string
+        self._special_token_regex = re.compile(r"<\|.*?\|>")
+        self._special_token_header_regex = re.compile(
+            r"<\|start_header_id\|>.*?<\|end_header_id\|>\n\n"
+        )
+
+    def _init_tokenizer(self, path: str):
+        """Initialize tokenizer based on file format detection."""
+        path_obj = Path(path)
+
+        # Check if it's a JSON file or contains tokenizer.json
+        is_json_format = (
+            path_obj.suffix == ".json"
+            or path_obj.name == "tokenizer.json"
+            or (path_obj.is_dir() and (path_obj / "tokenizer.json").exists())
+        )
+
+        if is_json_format:
+            self._init_from_json(path)
+        else:
+            self._init_from_tiktoken(path)
+
+    def _init_from_json(self, path: str):
+        """Initialize from tokenizer.json format."""
+        if not _HF_TOKENIZERS_AVAILABLE:
+            raise ImportError(
+                "HuggingFace tokenizers library is required for JSON format. "
+                "Install with: pip install tokenizers"
+            )
+
+        path_obj = Path(path)
+        if path_obj.is_dir():
+            # Look for tokenizer.json in directory
+            json_path = path_obj / "tokenizer.json"
+            if not json_path.exists():
+                raise FileNotFoundError(
+                    f"tokenizer.json not found in directory: {path}"
+                )
+            path = str(json_path)
+
+        self.hf_tokenizer = HFTokenizer.from_file(path)
+        self._use_hf = True
+
+    def _init_from_tiktoken(self, path: str):
+        """Initialize from tiktoken format."""
         self.tt_model = TikTokenBaseTokenizer(
             path=path,
             name="llama3_tiktoken",
@@ -111,15 +174,7 @@ class Llama3Tokenizer(ModelTokenizer, Transform):
             eos_id=self.eos_id,
             special_tokens=self.special_tokens,
         )
-        self.max_seq_len = max_seq_len
-
-        self.prompt_template = prompt_template
-
-        # Regex for removing special tokens from the decoded string
-        self._special_token_regex = re.compile(r"<\|.*?\|>")
-        self._special_token_header_regex = re.compile(
-            r"<\|start_header_id\|>.*?<\|end_header_id\|>\n\n"
-        )
+        self._use_hf = False
 
     def _validate_special_tokens(
         self,
@@ -150,10 +205,15 @@ class Llama3Tokenizer(ModelTokenizer, Transform):
 
     @property
     def base_vocab_size(self) -> int:
+        if self._use_hf:
+            # Subtract special tokens count for HF tokenizer
+            return self.hf_tokenizer.get_vocab_size() - len(self.special_tokens)
         return self.tt_model.base_vocab_size
 
     @property
     def vocab_size(self) -> int:
+        if self._use_hf:
+            return self.hf_tokenizer.get_vocab_size()
         return self.tt_model.vocab_size
 
     def encode(
@@ -162,6 +222,16 @@ class Llama3Tokenizer(ModelTokenizer, Transform):
         add_bos: bool = True,
         add_eos: bool = True,
     ) -> List[int]:
+        if self._use_hf:
+            # Encode with HF tokenizer
+            encoding = self.hf_tokenizer.encode(text, add_special_tokens=False)
+            tokens = encoding.ids
+
+            if add_bos:
+                tokens = [self.bos_id] + tokens
+            if add_eos:
+                tokens = tokens + [self.eos_id]
+            return tokens
         return self.tt_model.encode(text=text, add_bos=add_bos, add_eos=add_eos)
 
     def decode(
@@ -183,6 +253,24 @@ class Llama3Tokenizer(ModelTokenizer, Transform):
         Returns:
             str: The decoded string.
         """
+        if self._use_hf:
+            # Handle truncation for HF tokenizer
+            if truncate_at_eos:
+                for i, token_id in enumerate(token_ids):
+                    if token_id in self.stop_tokens:
+                        token_ids = token_ids[:i]
+                        break
+
+            decoded_string = self.hf_tokenizer.decode(
+                token_ids, skip_special_tokens=False
+            )
+            return (
+                self._remove_special_tokens(decoded_string)
+                if skip_special_tokens
+                else decoded_string
+            )
+
+        # Original tiktoken logic
         # We will remove special tokens manually via regex on the decoded string.
         # This is because removing all special tokens does not remove the role and
         # whitespace added from the special tokens, i.e., the "user" and "\n\n" in
@@ -306,12 +394,26 @@ class Llama3Tokenizer(ModelTokenizer, Transform):
             add_end_tokens_to_message = (
                 add_end_tokens if i == num_messages - 1 else True
             )
-            tokenized_message = self.tokenize_message(
-                message, add_end_tokens=add_end_tokens_to_message
+
+            # Tokenize each part separately for proper masking
+            tokenized_header = self._tokenize_header(message)
+            tokenized_body = self._tokenize_body(message)
+            tokenized_end = (
+                self._tokenize_end(message) if add_end_tokens_to_message else []
             )
 
-            tokens = tokens + tokenized_message
-            mask = mask + ([message.masked] * len(tokenized_message))
+            # Add tokens and masks separately
+            tokens = tokens + tokenized_header
+            mask = mask + ([True] * len(tokenized_header))  # Always mask headers
+
+            tokens = tokens + tokenized_body
+            mask = mask + (
+                [message.masked] * len(tokenized_body)
+            )  # Use message.masked for body
+
+            tokens = tokens + tokenized_end
+            mask = mask + ([True] * len(tokenized_end))  # Always mask end tokens
+
             if self.max_seq_len and len(tokens) >= self.max_seq_len:
                 break
 
