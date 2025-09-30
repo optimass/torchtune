@@ -279,15 +279,23 @@ def padded_collate_sft(
 
     # Align tokens and labels first
     if input_ids_seq_len > labels_seq_len:
-        labels = F.pad(labels, (0, input_ids_seq_len - labels_seq_len), value=ignore_idx)
+        labels = F.pad(
+            labels, (0, input_ids_seq_len - labels_seq_len), value=ignore_idx
+        )
     elif labels_seq_len > input_ids_seq_len:
-        input_ids = F.pad(input_ids, (0, labels_seq_len - input_ids_seq_len), value=padding_idx)
+        input_ids = F.pad(
+            input_ids, (0, labels_seq_len - input_ids_seq_len), value=padding_idx
+        )
 
     # Optionally pad to CP/TP multiple
     min_mult = _get_min_seq_multiple()
     if min_mult:
-        input_ids = _right_pad_to_multiple(input_ids, dim=1, multiple=min_mult, pad_value=padding_idx)
-        labels = _right_pad_to_multiple(labels, dim=1, multiple=min_mult, pad_value=ignore_idx)
+        input_ids = _right_pad_to_multiple(
+            input_ids, dim=1, multiple=min_mult, pad_value=padding_idx
+        )
+        labels = _right_pad_to_multiple(
+            labels, dim=1, multiple=min_mult, pad_value=ignore_idx
+        )
     return {"tokens": input_ids.long(), "labels": labels.long()}
 
 
@@ -524,7 +532,7 @@ def padded_collate_tiled_images_and_mask(
         )
 
     batch_dict = {
-    "tokens": collated_text["tokens"],
+        "tokens": collated_text["tokens"],
         "encoder_input": {
             "images": collated_images,
             "aspect_ratio": collated_aspect_ratios,
@@ -596,8 +604,12 @@ def padded_collate_packed(
     min_mult = _get_min_seq_multiple()
     if min_mult:
         tokens = _right_pad_to_multiple(tokens, dim=1, multiple=min_mult, pad_value=0)
-        labels = _right_pad_to_multiple(labels, dim=1, multiple=min_mult, pad_value=CROSS_ENTROPY_IGNORE_IDX)
-        input_pos = _right_pad_to_multiple(input_pos, dim=1, multiple=min_mult, pad_value=0)
+        labels = _right_pad_to_multiple(
+            labels, dim=1, multiple=min_mult, pad_value=CROSS_ENTROPY_IGNORE_IDX
+        )
+        input_pos = _right_pad_to_multiple(
+            input_pos, dim=1, multiple=min_mult, pad_value=0
+        )
         # block_mask shape: (bsz, T, T). Extend T to new length with zeros (no attention)
         new_T = tokens.size(1)
         cur_T = block_mask.size(-1)
@@ -620,6 +632,9 @@ def padded_collate_dpo(
     ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pad a batch of sequences for Direct Preference Optimization (DPO).
+
+
+
 
     This function takes a batch of sequences, where each sequence is represented
     as a dictionary with multiple key-value pairs. Each key corresponds to a different
@@ -845,15 +860,23 @@ def padded_collate_reinforce(
 
     # Align tokens and labels first
     if input_ids_seq_len > labels_seq_len:
-        labels = F.pad(labels, (0, input_ids_seq_len - labels_seq_len), value=ignore_idx)
+        labels = F.pad(
+            labels, (0, input_ids_seq_len - labels_seq_len), value=ignore_idx
+        )
     elif labels_seq_len > input_ids_seq_len:
-        input_ids = F.pad(input_ids, (0, labels_seq_len - input_ids_seq_len), value=padding_idx)
+        input_ids = F.pad(
+            input_ids, (0, labels_seq_len - input_ids_seq_len), value=padding_idx
+        )
 
     # Optionally pad to CP/TP multiple
     min_mult = _get_min_seq_multiple()
     if min_mult:
-        input_ids = _right_pad_to_multiple(input_ids, dim=1, multiple=min_mult, pad_value=padding_idx)
-        labels = _right_pad_to_multiple(labels, dim=1, multiple=min_mult, pad_value=ignore_idx)
+        input_ids = _right_pad_to_multiple(
+            input_ids, dim=1, multiple=min_mult, pad_value=padding_idx
+        )
+        labels = _right_pad_to_multiple(
+            labels, dim=1, multiple=min_mult, pad_value=ignore_idx
+        )
     return {"tokens": input_ids.long(), "labels": labels.long(), "reward": reward}
 
 
@@ -923,7 +946,9 @@ def padded_collate_privilege(
         )
         if new_tokens_wp.size(1) > padded_masks_wp.size(1):
             pad_t = new_tokens_wp.size(1) - padded_masks_wp.size(1)
-            padded_masks_wp = _pad_along_dim(padded_masks_wp, dim=1, pad_right=pad_t, value=True)
+            padded_masks_wp = _pad_along_dim(
+                padded_masks_wp, dim=1, pad_right=pad_t, value=True
+            )
         padded_tokens_wp, padded_labels_wp = new_tokens_wp, new_labels_wp
 
     collated_wp = {
@@ -996,7 +1021,9 @@ def padded_collate_privilege(
             )
             if new_tokens_wpta.size(1) > padded_masks_wpta.size(1):
                 pad_t = new_tokens_wpta.size(1) - padded_masks_wpta.size(1)
-                padded_masks_wpta = _pad_along_dim(padded_masks_wpta, dim=1, pad_right=pad_t, value=True)
+                padded_masks_wpta = _pad_along_dim(
+                    padded_masks_wpta, dim=1, pad_right=pad_t, value=True
+                )
             padded_tokens_wpta, padded_labels_wpta = new_tokens_wpta, new_labels_wpta
 
         collated_wpta = {
@@ -1064,7 +1091,9 @@ def padded_collate_privilege(
         )
         if new_tokens_np.size(1) > padded_masks_np.size(1):
             pad_t = new_tokens_np.size(1) - padded_masks_np.size(1)
-            padded_masks_np = _pad_along_dim(padded_masks_np, dim=1, pad_right=pad_t, value=True)
+            padded_masks_np = _pad_along_dim(
+                padded_masks_np, dim=1, pad_right=pad_t, value=True
+            )
         padded_tokens_np, padded_labels_np = new_tokens_np, new_labels_np
 
     collated_np = {
@@ -1121,4 +1150,116 @@ def padded_collate_grpo(
         "query_len": mini_batch["query_len"],
         "type": mini_batch["type"],
         "response_tokens": mini_batch["response_tokens"],
+    }
+
+
+# --- Online privilege collater (with CP padding) -----------------------------
+def _collate_privilege_side(
+    side_batch: List[Dict[str, Any]], *, padding_idx: int, ignore_idx: int
+) -> Dict[str, torch.Tensor]:
+    """
+    Pad a single side (with_privilege/without_privilege) for the online dataset.
+
+    Expects entries to have at least "tokens" and either "labels" or "mask".
+    Pads right to the max length, aligns tensors, and applies optional
+    context-parallel multiple padding.
+    """
+    tokens_list = [torch.tensor(x["tokens"], dtype=torch.long) for x in side_batch]
+
+    if all("labels" in x for x in side_batch):
+        labels_list = [torch.tensor(x["labels"], dtype=torch.long) for x in side_batch]
+    else:
+        labels_list = []
+        for x in side_batch:
+            toks = torch.tensor(x["tokens"], dtype=torch.long)
+            m = torch.tensor(
+                x.get("mask", [False] * len(x["tokens"])), dtype=torch.bool
+            )
+            lbl = torch.where(m, torch.tensor(ignore_idx, dtype=torch.long), toks)
+            labels_list.append(lbl)
+
+    if all("mask" in x for x in side_batch):
+        mask_list = [torch.tensor(x["mask"], dtype=torch.bool) for x in side_batch]
+    else:
+        mask_list = [lbl.eq(ignore_idx) for lbl in labels_list]
+
+    tokens = pad_sequence(tokens_list, batch_first=True, padding_value=padding_idx)
+    labels = pad_sequence(labels_list, batch_first=True, padding_value=ignore_idx)
+    mask = pad_sequence(mask_list, batch_first=True, padding_value=True)
+
+    max_len = max(tokens.size(1), labels.size(1), mask.size(1))
+    if tokens.size(1) < max_len:
+        tokens = _pad_along_dim(
+            tokens, dim=1, pad_right=max_len - tokens.size(1), value=padding_idx
+        )
+    if labels.size(1) < max_len:
+        labels = _pad_along_dim(
+            labels, dim=1, pad_right=max_len - labels.size(1), value=ignore_idx
+        )
+    if mask.size(1) < max_len:
+        mask = _pad_along_dim(mask, dim=1, pad_right=max_len - mask.size(1), value=True)
+
+    min_mult = _get_min_seq_multiple()
+    if min_mult:
+        tokens = _right_pad_to_multiple(
+            tokens, dim=1, multiple=min_mult, pad_value=padding_idx
+        )
+        labels = _right_pad_to_multiple(
+            labels, dim=1, multiple=min_mult, pad_value=ignore_idx
+        )
+        mask = _right_pad_to_multiple(mask, dim=1, multiple=min_mult, pad_value=True)
+
+    attention_mask = (~mask).to(torch.long)
+    return {
+        "tokens": tokens.long(),
+        "labels": labels.long(),
+        "mask": mask.bool(),
+        "attention_mask": attention_mask,
+    }
+
+
+def padded_collate_privilege_online(
+    batch: List[Dict[str, Any]],
+    padding_idx: int = 0,
+    ignore_idx: int = CROSS_ENTROPY_IGNORE_IDX,
+) -> Dict[str, Any]:
+    """
+    Collate for online privilege dataset samples.
+
+    Expected per-sample structure:
+      - "with_privilege": {"tokens", "labels"?, "mask"?}
+      - "without_privilege": {"tokens", "labels"?, "mask"?}
+      - "privileged_found": int flag (0/1)
+
+    Returns nested dicts for each side with tokens/labels/mask/attention_mask,
+    CP/TP padded if configured via set_min_seq_multiple or TUNE_MIN_SEQ_MULTIPLE.
+    """
+    with_priv = _collate_privilege_side(
+        [x["with_privilege"] for x in batch],
+        padding_idx=padding_idx,
+        ignore_idx=ignore_idx,
+    )
+    without_priv = _collate_privilege_side(
+        [x["without_privilege"] for x in batch],
+        padding_idx=padding_idx,
+        ignore_idx=ignore_idx,
+    )
+    priv_found = torch.tensor(
+        [int(x.get("privileged_found", 0)) for x in batch], dtype=torch.long
+    )
+    rewards = torch.tensor(
+        [float(x.get("reward", 0.0)) for x in batch], dtype=torch.float32
+    )
+    og_rewards = torch.tensor(
+        [float(x.get("og_reward", 0.0)) for x in batch], dtype=torch.float32
+    )
+    goals = [x.get("goal", "") for x in batch]
+   
+    return {
+        "with_privilege": with_priv,
+        "without_privilege": without_priv,
+        "privileged_found": priv_found,
+        "reward": rewards,
+        "og_reward": og_rewards,
+        'goal': goals,
     }

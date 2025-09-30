@@ -16,6 +16,7 @@ from torchtune.data._collate import (
     padded_collate_reinforce,
     padded_collate_grpo,
     padded_collate_privilege,
+    padded_collate_privilege_online
 )
 from torchtune.data._common import CROSS_ENTROPY_IGNORE_IDX
 from torchtune.data._messages import (
@@ -67,5 +68,7 @@ __all__ = [
     "padded_collate_traj_CE",
     "padded_collate_reinforce",
     "padded_collate_grpo",
-    "padded_collate_privilege"
+    "padded_collate_privilege",
+    'padded_collate_privilege_online'
+
 ]
