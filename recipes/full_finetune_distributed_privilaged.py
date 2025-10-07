@@ -151,6 +151,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         self.reference_logprobs_cache = {}
         self.reference_logprobs_cache_p = {}
         self.batch_info_cache = {}
+        # Online training annealing parameters
+        self.online_training_coeff = cfg.get("online_training_coeff", 0.0)
 
     def _get_sample_log_probs(
         self,
@@ -697,6 +699,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     return_logprobs=False,
                 )
             except Exception as e:
+                log.info(f"Error computing KL divergence for batch {batch_idx}: {e}")
                 kl_divergence = torch.tensor([1.0], device=self._device)
 
             rewards = reward - self.gamma * kl_divergence
@@ -775,7 +778,17 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             log.info(
                 f"Flipped reward range: [{min(all_rewards):.4f}, {max(all_rewards):.4f}]"
             )
-
+            # Explicitly delete large tensors and clear cache
+        del logits_with_priv
+        del logits_without_priv
+        del labels_with_priv
+        del labels_without_priv
+        del labels_shifted_with_priv
+        del labels_shifted_without_priv
+        del reward
+        del kl_divergence
+        if self.use_importance_sampling:
+            del ref_logprobs_chunks_q
         p_y_g_xz_mean = np.mean(p_y_g_zx)
         q_y_g_xz_mean = np.mean(q_y_g_xz)
         q_z_g_xy_mean = np.mean(q_z_g_xy)
@@ -2122,7 +2135,34 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         # Clip the ratio
         clipped_ratio = torch.clamp(ratio, self.epsilon_low_neg, self.epsilon_high_pos)
 
-        policy_loss = -(torch.min(ratio, clipped_ratio))
+        # Track clipping statistics
+        if not hasattr(self, "ppo_clip_stats_tracker"):
+            self.ppo_clip_stats_tracker = []
+
+        total_tokens = ratio.numel()
+        clipped_tokens = (
+            ((ratio < self.epsilon_low_neg) | (ratio > self.epsilon_high_pos))
+            .sum()
+            .item()
+        )
+
+        log.info(
+            f"Total tokens: {total_tokens}, Clipped tokens: {clipped_tokens} Percentage: {clipped_tokens/total_tokens*100:.2f}%"
+        )
+
+        self.ppo_clip_stats_tracker.append(
+            {
+                "total_tokens": total_tokens,
+                "clipped_tokens": clipped_tokens,
+                "clipped_low": (ratio < self.epsilon_low_neg).sum().item(),
+                "clipped_high": (ratio > self.epsilon_high_pos).sum().item(),
+                "mean_ratio": ratio.mean().detach().cpu().item(),
+            }
+        )
+
+        # PPO policy loss with advantages (standard PPO objective)
+        # L^CLIP = -E[min(r_t * A_t, clip(r_t, 1-ε, 1+ε) * A_t)]
+        policy_loss = -torch.min(ratio * advantages, clipped_ratio * advantages)
 
         del (
             wp_selected_log_ps_final,
@@ -2134,8 +2174,134 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             ratio,
             clipped_ratio,
         )
-        # Return summed ratios by default
+        # Return summed policy loss
         return policy_loss.sum()
+
+    def calculate_topr_loss(
+        self,
+        logits: List[torch.Tensor],
+        labels: torch.Tensor,
+        advantages: torch.Tensor,
+        ref_logits: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """
+        Calculate TOPR (Tapered Off-Policy Reinforcement Learning) loss.
+
+        For positive advantages (A > 0): SFT loss weighted by advantage
+        For negative advantages (A ≤ 0): Truncated Importance Sampling (TIS)
+
+        From the paper: https://arxiv.org/pdf/2503.14286
+        ∇J_topr(π) = Σ_{τ∈T+} μ(τ)R(τ)∇log π(τ) + Σ_{τ∈T-} μ(τ) * clip(π/μ, ε_low, ε_high) * R(τ) * ∇log π(τ)
+
+        Args:
+            logits: Current policy logits (list of chunks)
+            labels: Ground truth labels
+            advantages: Advantage values per sample
+            ref_logits: Optional reference policy logits for TIS (used for negative advantages)
+
+        Returns:
+            Combined TORPO loss (summed over valid tokens)
+        """
+        import torch.nn.functional as F
+
+        # Process chunks
+        labels_chunks = labels.view(1, -1).chunk(len(logits), dim=1)
+
+        policy_log_ps_list = []
+        ref_log_ps_list = []
+
+        # Gather log-probs chunk by chunk
+        for i, logit_chunk in enumerate(logits):
+            labels_flat = labels_chunks[i].view(-1)
+            valid_mask = labels_flat != self._loss_fn.ignore_index
+
+            if not valid_mask.any():
+                continue
+
+            # Filter to valid tokens
+            logit_valid = logit_chunk[valid_mask]
+            labels_valid = labels_flat[valid_mask]
+
+            # Current policy log-probs
+            log_ps = F.log_softmax(logit_valid, dim=-1)
+            vocab_size = log_ps.size(-1)
+            valid_indices = labels_valid.clamp(0, vocab_size - 1).unsqueeze(-1)
+            selected_log_ps = torch.gather(log_ps, dim=-1, index=valid_indices).squeeze(
+                -1
+            )
+            policy_log_ps_list.append(selected_log_ps)
+
+            # Reference policy log-probs (for negative advantages)
+            if ref_logits is not None:
+                ref_logit_chunk = ref_logits[i]
+                ref_logit_valid = ref_logit_chunk[valid_mask]
+                ref_log_ps = F.log_softmax(ref_logit_valid, dim=-1)
+                ref_selected_log_ps = torch.gather(
+                    ref_log_ps, dim=-1, index=valid_indices
+                ).squeeze(-1)
+                ref_log_ps_list.append(ref_selected_log_ps)
+
+        # Handle empty case
+        if not policy_log_ps_list:
+            return torch.tensor(0.0, device=logits[0].device)
+
+        # Concatenate all valid tokens
+        policy_log_ps = torch.cat(policy_log_ps_list)
+
+        # Separate positive and negative advantages
+        positive_mask = advantages > 0
+        negative_mask = advantages <= 0
+
+        total_loss = torch.tensor(0.0, device=logits[0].device, requires_grad=True)
+
+        # ===== Positive samples: SFT loss weighted by advantage =====
+        # L_positive = -Σ A * log π(τ) for A > 0
+        if positive_mask.any():
+            positive_loss = -(advantages * policy_log_ps).sum()
+            total_loss = total_loss + positive_loss
+            log.info(f"TORPO positive loss: {positive_loss.item():.4f}")
+
+        # ===== Negative samples: Truncated Importance Sampling =====
+        # L_negative = -Σ clip(π/μ, ε_low, ε_high) * A * log π(τ) for A ≤ 0
+        if negative_mask.any() and ref_logits is not None:
+            ref_log_ps = torch.cat(ref_log_ps_list)
+
+            # Importance weight: π(τ) / μ(τ)
+            # CRITICAL: Detach policy_log_ps for unbiased gradient estimation
+            importance_weight = torch.exp(policy_log_ps.detach() - ref_log_ps)
+
+            # Clip importance weight for negative samples
+            clipped_weight = torch.clamp(
+                importance_weight, min=self.epsilon_low_neg, max=self.epsilon_high_neg
+            )
+
+            # TIS loss: -clipped_weight * advantage * log π(τ)
+            # The gradient flows only through policy_log_ps, not through clipped_weight
+            negative_loss = -(clipped_weight * advantages * policy_log_ps).sum()
+            total_loss = total_loss + negative_loss
+
+            # Log statistics
+            clipped_tokens = (
+                (
+                    (importance_weight < self.epsilon_low_neg)
+                    | (importance_weight > self.epsilon_high_neg)
+                )
+                .sum()
+                .item()
+            )
+            log.info(
+                f"TORPO negative loss: {negative_loss.item():.4f}, "
+                f"Mean importance weight: {importance_weight.mean().item():.4f}, "
+                f"Clipped tokens: {clipped_tokens}/{importance_weight.numel()}"
+            )
+
+        elif negative_mask.any():
+            # Fallback: treat as SFT if no reference available
+            negative_loss = -(advantages * policy_log_ps).sum()
+            total_loss = total_loss + negative_loss
+            log.info(f"TORPO negative loss (no ref): {negative_loss.item():.4f}")
+
+        return total_loss
 
     def train_q_online_run(self, train_q=True, train_p=False) -> None:
         """
@@ -2164,6 +2330,16 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
+            # Log the current online training coefficient for this epoch
+            if self._is_rank_zero and train_q and train_p:
+                log.info("=" * 80)
+                log.info(
+                    f"Epoch {curr_epoch}: Online training coefficient = {self.online_training_coeff:.4f}"
+                )
+                log.info(f"  Q loss weight: {1.0 - self.online_training_coeff:.4f}")
+                log.info(f"  P loss weight: {self.online_training_coeff:.4f}")
+                log.info("=" * 80)
+
             # Update the sampler to ensure data is correctly shuffled across epochs
             # in case shuffle is True
             # NOTE: removing it from here and putting it before the epoch loop
@@ -2281,11 +2457,11 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
                 train_batch = batch["with_privilege"]
                 train_batch_np = batch["without_privilege"]
-                if self._skip_max_seq_len_samples(
-                    train_batch
-                ) or self._skip_max_seq_len_samples(batch["without_privilege"]):
-                    max_len_samples += 1
-                    continue
+                # if self._skip_max_seq_len_samples(
+                #     train_batch
+                # ) or self._skip_max_seq_len_samples(batch["without_privilege"]):
+                #     max_len_samples += 1
+                #     continue
 
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
@@ -2336,11 +2512,11 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 rank = torch.distributed.get_rank()
                 # Check if we should skip forward and backward pass for zero rewards
                 skip_computation = og_reward == 0
-                num_tokens += (
-                    current_num_tokens if not train_p else current_num_tokens * 2
-                )
+                log.info(f"Current number of tokens {current_num_tokens}")
+                num_tokens += current_num_tokens
 
                 # Build shifted labels once
+                log.info(f"{current_num_tokens=}")
                 labels_shifted = torch.hstack(
                     (
                         labels[..., 1:],
@@ -2357,17 +2533,14 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 # Importance sampling: use cached per-token ref logprobs from compute_rewards
                 ref_logprobs_for_loss = None
                 if self.use_importance_sampling:
-
                     ref_cached = self.reference_logprobs_cache.get(j)
                     if ref_cached is not None:
                         n_chunks = len(ref_cached)
-                        # ref_logprobs_for_loss = torch.cat(ref_cached,dim=1)[:,:action_start_pos].chunk(n_chunks, dim=1)
                         ref_logprobs_for_loss = ref_cached
 
-                # Memory optimization: Sequential forward/backward passes
                 total_loss = torch.tensor(0.0, device=self._device, requires_grad=True)
 
-                # First forward pass: with privilege
+                # Always compute forward with gradients for distributed sync
                 with self.activations_handling_ctx:
                     logits = self._model(**train_batch)
 
@@ -2394,6 +2567,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     )
                     * current_num_tokens
                 )
+                log.info(f"Calculated combined loss {combined_loss.item()}")
+
                 if train_p:
 
                     logits_with_priv = (
@@ -2403,40 +2578,64 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     )
                 else:
                     logits_with_priv = None
-                # Normalize and backward for first pass
-                if self._optimizer_in_bwd:
-                    torch.distributed.all_reduce(num_tokens)
-                    first_loss_normalized = combined_loss / num_tokens
-                else:
-                    first_loss_normalized = combined_loss
 
-                # Always call backward to satisfy activation offloading tracker
-                first_loss_normalized.backward()
-
-                # If not training Q, zero out the gradients immediately after backward
+                # Handle loss normalization based on whether we're training Q
                 if not train_q:
-                    self._model.zero_grad(set_to_none=True)
+                    # Detach so backward won't affect Q model parameters
+                    combined_loss_detached = combined_loss.detach()
+                    if self._optimizer_in_bwd:
+                        torch.distributed.all_reduce(num_tokens)
+                        first_loss_normalized = combined_loss_detached / num_tokens
+                    else:
+                        first_loss_normalized = combined_loss_detached
+
+                    # Manually clear the activation offloading tracker
+                    # since we're not doing a real backward pass
+                    if hasattr(self.activations_handling_ctx, "__enter__"):
+                        # Clear the tracker if using activation offloading
+                        try:
+                            from torchtune.training._activation_offloading import (
+                                OffloadActivations,
+                            )
+
+                            if isinstance(
+                                self.activations_handling_ctx, OffloadActivations
+                            ):
+                                self.activations_handling_ctx.tracker.clear()
+                        except (ImportError, AttributeError):
+                            pass
+                else:
+                    if self._optimizer_in_bwd:
+                        torch.distributed.all_reduce(num_tokens)
+                        first_loss_normalized = combined_loss / num_tokens
+                    else:
+                        first_loss_normalized = combined_loss
+
+                # Backward pass for Q loss to clear activation offloading tracker
+                # Apply online training coefficient weighting: (1 - coeff) * Q_loss
+                if train_q and train_p:
+                    q_weight = 1.0 - self.online_training_coeff
+                    weighted_first_loss = first_loss_normalized * q_weight
+                    weighted_first_loss.backward()
+                    if self._is_rank_zero and j == 0:
+                        log.info(
+                            f"Q loss weighted by {q_weight:.4f}: original={first_loss_normalized.item():.4f}, weighted={weighted_first_loss.item():.4f}"
+                        )
+                elif train_q:
+                    first_loss_normalized.backward()
+                # If not train_q, don't run backward at all - tracker already cleared above
 
                 total_loss = total_loss + combined_loss.detach()
-                if rank == 0:
-                    pbar.set_description(
-                        f"Sample {j+1}, Loss: {combined_loss.item():.4f}, Tokens: {current_num_tokens.item()}"
-                    )
-                # Clear first pass memory
-                allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+
+                del logits, combined_loss, first_loss_normalized
+                # if torch.cuda.is_available():
+                #     torch.cuda.empty_cache()
+                # Basic memory usage
+                # allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                # reserved = torch.cuda.memory_reserved() / 1024**3  # GB
                 # log.info(
                 #     f"CUDA Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB"
                 # )
-                del logits, combined_loss
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                # Basic memory usage
-                allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                reserved = torch.cuda.memory_reserved() / 1024**3  # GB
-                log.info(
-                    f"CUDA Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB"
-                )
                 if train_p:
                     # log.info("training_p")
                     # Second forward pass: without privilege (always execute for distributed sync)
@@ -2453,8 +2652,32 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                         logits_np, labels_np, self._loss_fn.ignore_index
                     )
 
-                    combined_loss_np = (
-                        self.calculate_ppo_clipped_importance_sampling(  # noqa: E501
+                    # Choose loss function based on configuration
+                    if self.train_p_loss == "trpo":
+                        log.info("Using TORPO loss for P model training")
+                        # For TORPO, we need reference logits for negative advantages
+                        ref_logits_np = None
+                        if advantages <= 0 and logits_with_priv is not None:
+                            # Use privileged logits as reference for negative advantages
+                            ref_logits_np = (
+                                logits_with_priv
+                                if isinstance(logits_with_priv, list)
+                                else [logits_with_priv]
+                            )
+
+                        combined_loss_np = self.calculate_topr_loss(
+                            logits=(
+                                logits_with_priv
+                                if isinstance(logits_np, list)
+                                else [logits_np]
+                            ),
+                            labels=labels_np,
+                            advantages=advantages,
+                            ref_logits=ref_logits_np,
+                        )
+                    else:  # default to PPO
+                        log.info("Using PPO loss for P model training")
+                        combined_loss_np = self.calculate_ppo_clipped_importance_sampling(  # noqa: E501
                             wp_priv_logits=(
                                 logits_with_priv
                                 if isinstance(logits_with_priv, list)
@@ -2469,25 +2692,10 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                             labels_np=labels_np,
                             advantages=advantages,
                         )
+                    log.info(
+                        f"Calculated combined loss with np model ({self.train_p_loss}): {combined_loss_np.item()}"
                     )
                     del logits_with_priv, labels
-                    # combined_loss_np = (
-                    #     self._loss_fn(
-                    #         logits=logits_np,
-                    #         labels=labels_np,
-                    #         reward=advantages,
-                    #         precomputed_importance_ratio=importance_ratio,
-                    #         # Note: no ref_logprobs or PPO bounds for NP model
-                    #     )
-                    #     * current_num_tokens
-                    # )
-
-                    # Apply skip computation by zeroing the loss instead of skipping
-                    # combined_loss_np = (
-                    #     combined_loss_np
-                    #     if not skip_computation
-                    #     else combined_loss_np * 0.0
-                    # )
 
                     # Normalize and backward for second pass
                     if self._optimizer_in_bwd:
@@ -2495,12 +2703,19 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     else:
                         second_loss_normalized = combined_loss_np
 
-                    second_loss_normalized.backward()
-                    total_loss = total_loss + combined_loss_np.detach()
+                    # Apply online training coefficient weighting: coeff * P_loss
+                    if train_q and train_p:
+                        p_weight = self.online_training_coeff
+                        weighted_second_loss = second_loss_normalized * p_weight
+                        weighted_second_loss.backward()
+                        if self._is_rank_zero and j == 0:
+                            log.info(
+                                f"P loss weighted by {p_weight:.4f}: original={second_loss_normalized.item():.4f}, weighted={weighted_second_loss.item():.4f}"
+                            )
+                    else:
+                        second_loss_normalized.backward()
 
-                    log.info(
-                        f"Combined loss with np model {combined_loss_np.detach().item()}"
-                    )
+                    total_loss = total_loss + combined_loss_np.detach()
                     del (
                         logits_np,
                         combined_loss_np,
@@ -2510,12 +2725,9 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 else:
                     del logits_with_priv
 
-                # Clear second pass memory
-                # Final memory cleanup
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-                # Update running loss with total from both passes
                 running_loss += total_loss * batch_size
 
                 # Handle distributed reduction for running_loss only (gradients already accumulated)
@@ -2544,10 +2756,13 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                         if self.max_bsize and (idx + 1) == n_samples:
                             if number_leftover_samples == 1:
                                 number_leftover_samples = n_samples
+                            # scaler = torch.tensor(
+                            #     number_leftover_samples / self.max_bsize
+                            #     if number_leftover_samples > 0
+                            #     else n_samples / self.max_bsize
+                            # )
                             scaler = torch.tensor(
-                                number_leftover_samples / self.max_bsize
-                                if number_leftover_samples > 0
-                                else n_samples / self.max_bsize
+                                1, device=self._device, dtype=torch.float32
                             )
 
                             training.scale_grads(
@@ -2591,7 +2806,6 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     pbar.set_description(
                         f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
                     )
-                    n_samples
                     # Log per-step metrics
 
                     if self._is_rank_zero:
@@ -2625,6 +2839,57 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                             "q_z_g_xy_mean": q_z_g_xy_mean,
                             "p_y_g_zx_mean": p_y_g_zx_mean,
                         }
+
+                        # Aggregate PPO clipping statistics
+                        if (
+                            hasattr(self, "ppo_clip_stats_tracker")
+                            and self.ppo_clip_stats_tracker
+                        ):
+                            total_tokens_sum = sum(
+                                s["total_tokens"] for s in self.ppo_clip_stats_tracker
+                            )
+                            clipped_tokens_sum = sum(
+                                s["clipped_tokens"] for s in self.ppo_clip_stats_tracker
+                            )
+                            clipped_low_sum = sum(
+                                s["clipped_low"] for s in self.ppo_clip_stats_tracker
+                            )
+                            clipped_high_sum = sum(
+                                s["clipped_high"] for s in self.ppo_clip_stats_tracker
+                            )
+                            mean_ratio_avg = (
+                                sum(
+                                    s["mean_ratio"] * s["total_tokens"]
+                                    for s in self.ppo_clip_stats_tracker
+                                )
+                                / total_tokens_sum
+                                if total_tokens_sum > 0
+                                else 0.0
+                            )
+
+                            log_dict.update(
+                                {
+                                    "ppo_clipped_tokens": clipped_tokens_sum,
+                                    "ppo_total_tokens": total_tokens_sum,
+                                    "ppo_clipped_low": clipped_low_sum,
+                                    "ppo_clipped_high": clipped_high_sum,
+                                    "ppo_clip_percentage": (
+                                        100.0 * clipped_tokens_sum / total_tokens_sum
+                                        if total_tokens_sum > 0
+                                        else 0.0
+                                    ),
+                                    "ppo_mean_ratio": mean_ratio_avg,
+                                }
+                            )
+
+                            log.info(
+                                f"PPO Clip - Total: {total_tokens_sum}, Clipped: {clipped_tokens_sum} "
+                                f"({100.0 * clipped_tokens_sum / total_tokens_sum:.2f}%), "
+                                f"Low: {clipped_low_sum}, High: {clipped_high_sum}"
+                            )
+
+                            self.ppo_clip_stats_tracker = []
+
                         # Add gradient norm stats to logging
                         log_dict.update(grad_norm_stats)
                         if self._log_peak_memory_stats:
@@ -2927,11 +3192,12 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                         if self.max_bsize and (idx + 1) == n_samples:
                             if number_leftover_samples == 1:
                                 number_leftover_samples = n_samples
-                            scaler = torch.tensor(
-                                number_leftover_samples / self.max_bsize
-                                if number_leftover_samples > 0
-                                else n_samples / self.max_bsize
-                            )
+                            # scaler = torch.tensor(
+                            #     number_leftover_samples / self.max_bsize
+                            #     if number_leftover_samples > 0
+                            #     else n_samples / self.max_bsize
+                            # )
+                            scaler = torch.tensor(1, device=self._device)
 
                             training.scale_grads(
                                 self._model,

@@ -158,7 +158,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             raise RuntimeError(
                 "Using fused optimizer on CPU is only supported in PyTorch nightly."
             )
-
+        self.train_p_loss = cfg.get("train_p_loss", 'ppo')
         # logging attributes
         self._output_dir = cfg.output_dir
         self.max_bsize = cfg.get("max_bsize", 512)
@@ -198,6 +198,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.apply_advantage_in_tune = cfg.get("apply_advantage_in_tune", False)
         self.use_importance_sampling = cfg.get("use_importance_sampling", False)
         self.train_q_online_with_p = cfg.get("train_q_online_with_p", True)
+        self.loss_type = cfg.get("loss_type", "ppo")  # "ppo" or "torpo"
         if self._log_peak_memory_stats and self._device.type != "cuda":
             log.info(
                 "log_peak_memory_stats was set to True, however, training does not use cuda. Setting log_peak_memory_stats=False."

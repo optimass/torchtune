@@ -44,29 +44,44 @@ class priv_dataloader(Dataset):
 
     def _maybe_replace_action(self, output: str, sample: Mapping[str, Any]) -> str:
         """
-        If match_reward is -1, replace the content of the last <action>...</action>
-        block in the output with the expected action, preserving the tags.
-        Assumes required keys exist in the sample.
+        If match_reward is -1 and there is an <action>...</action> block, replace the last block
+        with the expected action. If there is NO <action> block:
+          - If a <think>...</think> segment exists, keep everything through its end and append the action.
+          - Otherwise, replace the entire output with just the action block.
         """
         match_reward = sample["match_reward"]
         expected_action = sample["expected_action"]
         if match_reward != -1:
             return output
 
-        # Find the last <action>...</action> block
         action_matches = list(
             re.finditer(r"<action>.*?</action>", output, flags=re.DOTALL)
         )
         if not action_matches:
-            return output
+            think_block = None
+            for m in re.finditer(r"<think>.*?</think>", output, flags=re.DOTALL):
+                think_block = m
+            if think_block is not None:
+                kept = output[: think_block.end()]
+                return f"{kept}{expected_action}"
+            # No think and no action: fully replace
+            return f"{expected_action}"
 
+        # Existing action blocks present: replace the last one
         start, end = action_matches[-1].span()
-        replacement = f"<action>{expected_action}</action>"
+        replacement = f"{expected_action}"
         return output[:start] + replacement + output[end:]
 
     def _prepare_sample(self, sample: Mapping[str, Any]) -> Dict[str, Any]:
         prompt = sample["prompt"]
         output = sample["output"]
+        starting_prompt = prompt
+        reamaining_prompt = None
+        try:
+            starting_prompt = sample["prompt"]["traj"][0]['content']
+            reamaining_prompt = sample["prompt"]["traj"][1:]
+        except Exception as e:
+            pass
 
         # If match_reward is -1, replace the last action with the expected_action
         output_goal_action = self._maybe_replace_action(output, sample)
@@ -74,35 +89,64 @@ class priv_dataloader(Dataset):
         # Detect if privileged information tags are present
         def _extract_parts(prompt: str, output: str):
             secret_pattern = r"<Secret information>.*?</Secret information>"
-            privileged_found = 1 if re.search(secret_pattern, prompt, flags=re.DOTALL) else 0
-            prompt_no_secret = re.sub(secret_pattern, "", prompt, flags=re.DOTALL).strip()
-            action_blocks = list(
-            re.finditer(r"<action>.*?</action>", output, flags=re.DOTALL)
+            privileged_found = (
+                1 if re.search(secret_pattern, prompt, flags=re.DOTALL) else 0
             )
-            action_start_char, action_end_char = (
-            action_blocks[-1].span() if action_blocks else (0, 0)
+            prompt_no_secret = re.sub(
+                secret_pattern, "", prompt, flags=re.DOTALL
+            ).strip()
+            # Prefer splitting at the end of the last <think>...</think> block.
+            think_matches = list(
+                re.finditer(r"<think>.*?</think>", output, flags=re.DOTALL)
             )
+            if think_matches:
+                action_start_char = think_matches[-1].end()
+            else:
+                # Fallback: if no <think> found, try legacy <action> split; else 0
+                action_blocks = list(
+                    re.finditer(r"<action>.*?</action>", output, flags=re.DOTALL)
+                )
+                action_start_char = action_blocks[-1].span()[0] if action_blocks else 0
             before_action = output[:action_start_char]
-            return prompt, prompt_no_secret, output, action_start_char, before_action, privileged_found
+            return (
+                prompt,
+                prompt_no_secret,
+                output,
+                action_start_char,
+                before_action,
+                privileged_found,
+            )
 
-        prompt, prompt_no_secret, output, action_start_char, before_action, privileged_found = _extract_parts(
-            prompt, output
-        )
+        (
+            starting_prompt,
+            starting_prompt_no_secret,
+            output,
+            action_start_char,
+            before_action,
+            privileged_found,
+        ) = _extract_parts(starting_prompt, output)
 
         # Scenario 1: p(output | prompt_with_secret)
-        with_privilege = self._process_scenario(prompt, output, before_action)
+        with_privilege = self._process_scenario(starting_prompt, output, before_action,reamaining_prompt)
 
         # Scenario 2: p(output | prompt_without_secret)
         without_privilege = self._process_scenario(
-            prompt_no_secret, output, before_action
+            starting_prompt_no_secret, output, before_action,reamaining_prompt
         )
-        
-        prompt_target_action, _, output_target_action, _, before_action_target_action, _  \
-            = _extract_parts(prompt_no_secret,output_goal_action)
-        
-        without_privilege_target_action = self._process_scenario(prompt_target_action, output_target_action, before_action_target_action)
 
+        (
+            prompt_target_action,
+            _,
+            output_target_action,
+            _,
+            before_action_target_action,
+            _,
+        ) = _extract_parts(starting_prompt_no_secret, output_goal_action)
 
+        without_privilege_target_action = self._process_scenario(
+            prompt_target_action, output_target_action, before_action_target_action,reamaining_prompt
+        )
+        self.tests(with_privilege, without_privilege)
 
         return {
             "with_privilege": with_privilege,
@@ -116,7 +160,31 @@ class priv_dataloader(Dataset):
             "without_privilege_target_action": without_privilege_target_action,
             # "expected_action": sample.get("expected_action", ""),
         }
+    def tests(self, with_privilege, without_privilege):
+        """
+        Ensure that the number of tokens in the action/think region differs
+        between the privileged and non-privileged processed scenarios.
 
+        Raises AssertionError if the action lengths are identical (which would
+        indicate the privileged content did not change the generated region size).
+        """
+        a_start = with_privilege["action_start_pos"]
+        a_end = with_privilege["action_end_pos"]
+        b_start = without_privilege["action_start_pos"]
+        b_end = without_privilege["action_end_pos"]
+
+        a_end_prompt = with_privilege["end_of_prompt"]
+        b_end_prompt = without_privilege["end_of_prompt"]
+        a_len = a_end - a_start
+        b_len = b_end - b_start
+
+        a_think_len = a_start - a_end_prompt
+        b_think_len = b_start - b_end_prompt
+
+        # We expect the privileged and non-privileged action/think lengths to differ.
+        assert a_len == b_len, f"action/think lengths should not differ: {a_len} == {b_len}"
+        assert a_think_len == b_think_len, f"think lengths should not differ: {a_think_len} == {b_think_len}"
+        return True
     def _encode_with_role(
         self,
         content: str,
@@ -155,13 +223,26 @@ class priv_dataloader(Dataset):
             [temp_message],
         )[0]
 
+    # Public controller -------------------------------------------------
     def _process_scenario(
+        self, prompt, output: str, before_action: str,remaining_prompt=None
+    ) -> Dict[str, Any]:
+        """Dispatch to single or multi message processing.
+
+        If ``prompt`` is a list of prior messages (each a mapping with keys
+        ``role`` and ``content``) we treat them as immutable history: all
+        their tokens are assigned ignore_index (masked from loss). Otherwise
+        we fall back to the original single-string behavior.
+        """
+        if remaining_prompt is not None:  # multi-turn history
+            return self._process_scenario_multi(prompt, output, before_action,remaining_prompt)
+        return self._process_scenario_single(prompt, output, before_action)
+
+    # Single (original) -------------------------------------------------
+    def _process_scenario_single(
         self, prompt: str, output: str, before_action: str
     ) -> Dict[str, Any]:
-        """
-        Helper function to process a single scenario (e.g. with or without privilege).
-        Builds the tokenized sequence piece by piece for complete control over positions.
-        """
+        """Original single-prompt implementation (unchanged logic)."""
         # Extract the action text from the output
         action_blocks = list(
             re.finditer(r"<action>.*?</action>", output, flags=re.DOTALL)
@@ -237,6 +318,106 @@ class priv_dataloader(Dataset):
             )
         )
 
+        return {
+            "tokens": tokens,
+            "labels": labels,
+            "mask": mask,
+            "action_start_pos": action_start_pos,
+            "action_end_pos": action_end_pos,
+            "end_of_prompt": end_of_prompt,
+        }
+
+    # Multi (chat history) ----------------------------------------------
+    def _process_scenario_multi(
+        self, prompt: List[Mapping[str, Any]], output: str, before_action: str,
+        remaining_prompt: Optional[List[Mapping[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Process a scenario where ``messages`` is a prior dialogue history.
+
+        Design choices:
+        - Every prior message token is masked from loss (labels set to ignore idx).
+        - We re-use ``_encode_with_role`` for role-aware tokenization.
+        - The final generated portion corresponds to ``before_action`` + ``<action>`` block
+          (and optional terminators) exactly like the single variant.
+        - Each message is encoded similarly to the single prompt (we strip the trailing
+          end-of-turn token by slicing ``[:-1]`` to mirror the single path behaviour).
+        """
+        # 1. Tokenize history
+        messages = [{"role":"system",'content':prompt}] + remaining_prompt 
+        history_tokens: List[int] = []
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            # Add BOS only for very first message to keep sequence consistent
+            encoded = self._encode_with_role(
+                content,
+                role=role,
+                add_bos=True,
+                add_eos=False,
+                eot_for_message=True,
+            )
+            # # Mirror single behaviour: drop last token (assumed eot / delimiter)
+            # if encoded:
+            #     encoded = encoded[:-1]
+            history_tokens.extend(encoded)
+
+        # 2. Extract action as everything after the last </think>
+        think_matches = list(
+            re.finditer(r"<think>.*?</think>", output, flags=re.DOTALL)
+        )
+        if think_matches:
+            action_text = output[think_matches[-1].end() :]
+        else:
+            action_text = output
+        after_action = ""  # always empty by design
+
+        # 3. Encode before_action (assistant continuation, no BOS/EOS, strip trailing delim similar to single)
+        before_action_tokens: List[int] = []
+        if before_action:
+            before_action_tokens = self._encode_with_role(
+                before_action,
+                role="assistant",
+                add_bos=False,
+                add_eos=False,
+                eot_for_message=False,
+            )
+            # Strip the last two tokens as done in single path ([:-2]) if long enough
+            if len(before_action_tokens) >= 2:
+                before_action_tokens = before_action_tokens[:-2]
+
+        # 4. Encode action and optional after_action raw
+        action_tokens: List[int] = []
+        if action_text:
+            action_tokens = self._model_transform.encode(
+                action_text, add_bos=False, add_eos=False
+            )
+        # We ignore after_action_tokens for parity with single (they are not appended)
+
+        end_of_sentence_tokens = [128009, 128001]
+
+        # 5. Concatenate
+        tokens = (
+            history_tokens
+            + before_action_tokens
+            + action_tokens
+            + end_of_sentence_tokens
+        )
+
+        end_of_prompt = len(history_tokens)
+        action_start_pos = len(history_tokens) + len(before_action_tokens)
+        action_end_pos = action_start_pos + len(action_tokens)
+
+        # 6. Mask: history True (ignored), rest False (trainable)
+        mask = [True] * len(history_tokens) + [False] * (
+            len(tokens) - len(history_tokens)
+        )
+        labels = list(
+            np.where(
+                mask,
+                CROSS_ENTROPY_IGNORE_IDX,
+                tokens,
+            )
+        )
         return {
             "tokens": tokens,
             "labels": labels,

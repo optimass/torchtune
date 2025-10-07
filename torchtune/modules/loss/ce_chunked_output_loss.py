@@ -74,6 +74,7 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
         labels: torch.Tensor,
         epsilon_low: float = 0.0,
         epsilon_high: float = float("inf"),
+        labels_old=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Calculate the importance ratio for the new and reference log probabilities.
@@ -101,7 +102,6 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
                 new_log_ps, dim=-1, index=valid_indices.unsqueeze(-1)
             ).squeeze(-1)
 
-            # old_log_ps is already the selected value
             old_selected = old_log_ps
 
             # Calculate the importance ratio (unclipped)
@@ -150,7 +150,9 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
                 r_val = float(reward.view(-1)[0].item())
             else:
                 r_val = float(reward)
-            reward_grid = torch.full_like(labels.long(), fill_value=r_val, dtype=torch.float32)
+            reward_grid = torch.full_like(
+                labels.long(), fill_value=r_val, dtype=torch.float32
+            )
 
         reward_chunks_2d = [
             rc for rc in reward_grid.chunk(self.num_output_chunks, dim=1)
@@ -202,7 +204,6 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
 
         # Update simple last_clip_stats for bs=1
 
-
         return ratio_chunks
 
     def forward(
@@ -213,6 +214,7 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
         reward: Optional[torch.Tensor] = None,
         epsilon_low: float = 0.0,
         epsilon_high: float = float("inf"),
+        precomputed_importance_ratio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -264,7 +266,15 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
 
         # Process reference logprobs for importance sampling
         ratio_chunks = None
-        if ref_logprobs is not None:
+        if precomputed_importance_ratio is not None:
+            # If a precomputed ratio is provided, chunk it.
+            ratio_chunks = [
+                r_chunk.reshape(-1)
+                for r_chunk in precomputed_importance_ratio.chunk(
+                    self.num_output_chunks, dim=0
+                )
+            ]
+        elif ref_logprobs is not None:
             # Ensure we have a list of flattened ref logprobs chunks
             if isinstance(ref_logprobs, torch.Tensor):
                 ref_chunks_2d = [
@@ -358,7 +368,9 @@ class CEWithChunkedOutputLoss(torch.nn.Module):
             log_probs = F.log_softmax(logits_chunk, dim=-1)
             vocab_size = log_probs.size(-1)
             valid_indices = labels_chunk.clamp(0, vocab_size - 1)
-            gathered_log_probs = torch.gather(log_probs, dim=-1, index=valid_indices.unsqueeze(-1)).squeeze(-1)
+            gathered_log_probs = torch.gather(
+                log_probs, dim=-1, index=valid_indices.unsqueeze(-1)
+            ).squeeze(-1)
 
             gathered_probs = gathered_log_probs.exp() + self.epsilon
 
