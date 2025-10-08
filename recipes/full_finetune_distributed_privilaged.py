@@ -320,7 +320,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
             # Gather the log probabilities of the target tokens
             gathered_log_probs = torch.gather(
-                logprob_chunk, dim=-1, index=valid_indices.unsqueeze(-1)
+                logprob_chunk, dim=-1, index=valid_indices.unsqueeze(0)
             ).squeeze(-1)
 
             # Apply mask to zero out ignored tokens
@@ -347,6 +347,69 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         )
 
         return mean_log_probs
+
+    def _get_log_probs_for_positions(
+        self,
+        logits: List[torch.Tensor],
+        labels: torch.Tensor,
+        positions: List[Tuple[int, int]],
+    ) -> torch.Tensor:
+        """
+        Extract and sum log probabilities for tokens at specified positions.
+        Uses the tested _get_sample_log_probs and _get_sample_log_probs_from_chunks.
+
+        Args:
+            logits: List of logit tensors (one per chunk)
+            labels: Label tensor
+            positions: List of (start, end) token positions
+
+        Returns:
+            Scalar tensor with sum of log-probs across all positions
+        """
+        if not positions:
+            return torch.tensor(0.0, device=self._device)
+
+        total_log_prob = torch.tensor(0.0, device=self._device)
+        labels = labels.flatten()
+        # Get per-token log-probs for the entire sequence
+        batch_size = 1
+        shifted_labels = torch.hstack(
+            (labels[..., 1:], self.ignore_labels_cache[:batch_size].squeeze(0))
+        ).unsqueeze(0)
+
+        # Get per-token logprobs using existing method
+        logprobs_chunks = self._get_sample_log_probs(
+            logits,
+            shifted_labels,
+            return_per_token=True,
+        )
+        catted_logprobs = torch.cat(logprobs_chunks, dim=1).squeeze(0)
+        total_tokens = 0 
+        # For each position range, extract the relevant tokens
+        for start, end in positions[0]:
+            if start >= end or end > labels.shape[-1]:
+                continue
+
+            # Create a masked version where only this segment is valid
+            segment_labels = labels.clone()
+            mask = torch.ones_like(segment_labels, dtype=torch.bool)
+            mask[start:end] = False
+            segment_labels = torch.where(
+                mask,
+                torch.tensor(self._loss_fn.ignore_index, device=labels.device),
+                segment_labels,
+            )
+            total_tokens += (end - start)
+            
+            # Compute log-probs for this segment
+            segment_log_prob = catted_logprobs[start : (end - 1)].sum()
+
+            # Scale by number of valid tokens to get sum instead of mean
+            # num_valid = end - start
+            total_log_prob = total_log_prob + segment_log_prob
+        total_log_prob = total_log_prob / total_tokens
+
+        return total_log_prob.squeeze()
 
     def _compute_kl_divergence_rao_blackwellized_masked(
         self,
@@ -567,34 +630,46 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         float,
         Dict[str, List[float]],
         List[float],
+        List[float],
+        List[float],  # NEW: encoder losses
     ]:
         """
-        Computes rewards and advantages for each sample in the dataloader.
-        The reward combines the original reward with KL divergence penalty:
-        reward = original_reward - gamma * KL(thought_tokens)
+        Computes rewards, advantages, and IWAE encoder losses for each sample.
 
-        KL divergence is computed on "thought" tokens (between prompt and action):
-        KL(p(thought | prompt_without_secret) || p(thought | prompt_with_secret))
+        IWAE objective with exponential reward tilting:
+        L_q = E_{z_{1:K} ~ q_φ(·|x,h)} [
+            -∑_{k=1}^K (log(1/K ∑_{j=1}^K w̃_j) - b_k) log q_φ(z_k|x,h)
+        ]
 
-        This uses the Rao-Blackwellized estimator for KL divergence on thought tokens.
-        Advantages are calculated as reward - mean(rewards for the same goal).
+        where: w̃_k = w_k · exp(β·R(a_{0:T}))
+               w_k = p_θ(a_{0:T}, z_k | x) / q_φ(z_k | x, h)
+               b_k = log(1/(K-1) ∑_{j≠k} w̃_j)  [leave-one-out baseline]
+
+        The reward combines:
+        1. Original task reward
+        2. KL divergence penalty: -kl_penalty_weight * KL(thought_tokens)
+        3. Already included in IWAE weights via exponential tilting
 
         Returns:
             A tuple containing:
-            - A list of rewards for each sample (original + KL penalty).
+            - A list of rewards for each sample.
             - A list of advantages for each sample.
-            - Mean log probability of action tokens without privilege (p_y_g_zx_mean).
-            - Mean log probability of action tokens with privilege (q_y_g_xz_mean).
-            - Mean entropy of thought tokens with privilege (q_z_g_xy_mean).
+            - Mean log probability of action tokens without privilege (p_y_g_xz_mean).
+            - Mean log probability of think tokens without privilege (p_z_g_xy_mean).
+            - Mean log probability of think tokens with privilege (q_z_g_xy_mean).
             - Dictionary of rewards grouped by goal.
             - A list of KL divergences for each sample (thought tokens only).
+            - A list of log importance weights for each sample.
+            - A list of IWAE encoder losses for each sample.
         """
         self._model.eval()
         all_rewards = []
         all_goals = []
-        p_y_g_zx = []
-        q_z_g_xy = []  # This will now store entropy of thought tokens
-        q_y_g_xz = []  # This will store action log-probs with privilege
+        all_encoder_losses = []  # NEW: IWAE encoder losses
+        all_log_importance_weights = []  # NEW: log importance weights
+        p_y_g_xz = []  # log p_θ(a_k | x, z_k): action log-probs WITHOUT privilege
+        p_z_g_xy = []  # log p_θ(z_k | x): think log-probs WITHOUT privilege
+        q_z_g_xy = []  # log q_φ(z_k | x, h): think log-probs WITH privilege
         kls = []
         dataloader = self._dataloader
 
@@ -608,112 +683,297 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         # Track trajectory indices and steps for GRPO grouping
         all_trajectory_indices: List[int] = []
         all_steps: List[int] = []
-        for batch in tqdm(dataloader, desc="Computing Rewards"):
-            all_steps.append(batch.get("step", 0))
-            all_trajectory_indices.append(batch.get("trajectory_id", 0))
-            goals = batch.pop("goal", None)
-            _ = batch.pop("privileged_found", None)
-            reward = torch.tensor([batch.pop("reward")], device=self._device)
 
-            utils.batch_to_device(batch, self._device)
+        # NEW: Group samples by (goal, step) for K-sample IWAE computation
+        samples_by_goal_step: Dict[str, Dict[int, List[Dict]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
 
-            # Record trajectory indices and steps for grouping (move to CPU for list)
+        # First pass: collect all samples and group them
+        for batch in tqdm(dataloader, desc="Collecting samples"):
+            step = batch.get("step", 0)
+            traj_id = batch.get("trajectory_id", 0)
+            goals = batch.get("goal", None)[0]
 
-            # with privilege
-            batch_with_priv = batch["with_privilege"]
-            labels_with_priv = batch_with_priv["labels"]
-            model_inputs_with_priv = {
-                k: v
-                for k, v in batch_with_priv.items()
-                if k
-                not in [
-                    "labels",
-                    "action_start_pos",
-                    "action_end_pos",
-                    "end_of_prompt",
-                    "mask",
-                    "attention_mask",
-                ]
-            }
-            with torch.no_grad():
-                logits_with_priv = self._model(**model_inputs_with_priv)
-                logits_with_priv = [
-                    logit / self.sampling_temperature for logit in logits_with_priv
-                ]
+            all_steps.append(step)
+            all_trajectory_indices.append(traj_id)
 
-            # without privilege
-            batch_without_priv = batch["without_privilege"]
-            labels_without_priv = batch_without_priv["labels"]
-            model_inputs_without_priv = {
-                k: v
-                for k, v in batch_without_priv.items()
-                if k
-                not in [
-                    "labels",
-                    "action_start_pos",
-                    "action_end_pos",
-                    "end_of_prompt",
-                    "mask",
-                    "attention_mask",
-                ]
-            }
-            with torch.no_grad():
-                logits_without_priv = self._ref_model(**model_inputs_without_priv)
-                logits_without_priv = [
-                    logit / self.sampling_temperature for logit in logits_without_priv
-                ]
-            labels_shifted_with_priv = torch.hstack(
-                (
-                    labels_with_priv[..., 1:],
-                    self.ignore_labels_cache[: labels_with_priv.shape[0]],
-                )
+            reward = torch.tensor([batch.get("reward", 0.0)], device=self._device)
+
+            # Store batch data for later processing
+            samples_by_goal_step[goals][step].append(
+                {
+                    "batch": batch,
+                    "batch_idx": batch_idx,
+                    "traj_id": traj_id,
+                    "step": step,
+                    "goal": goals,
+                    "reward": reward,
+                }
             )
-            labels_shifted_without_priv = torch.hstack(
-                (
-                    labels_without_priv[..., 1:],
-                    self.ignore_labels_cache[: labels_without_priv.shape[0]],
-                )
-            )
-
-            # Compute KL divergence (positions optional; defaults to all non-ignored)
-            if self.use_importance_sampling:
-
-                ref_logprobs_chunks_q: List[torch.Tensor] = self._get_sample_log_probs(
-                    logits_with_priv,
-                    labels_shifted_with_priv,
-                    return_per_token=True,
-                )
-                self.reference_logprobs_cache[batch_idx] = ref_logprobs_chunks_q
-            # if (end_of_prompt_without_priv - action_start_pos_without_priv).item() == (end_of_prompt_without_priv - action_start_pos_without_priv).item():
-            try:
-                # Positions are optional: compute KL over all non-ignored labels if not provided
-                kl_divergence = self._compute_kl_divergence_rao_blackwellized_masked(
-                    logits_without_priv,
-                    logits_with_priv,
-                    labels_without_priv,
-                    labels_with_priv,
-                    None,
-                    None,
-                    None,
-                    None,
-                    return_logprobs=False,
-                )
-            except Exception as e:
-                log.info(f"Error computing KL divergence for batch {batch_idx}: {e}")
-                kl_divergence = torch.tensor([1.0], device=self._device)
-
-            rewards = reward - self.gamma * kl_divergence
-
-            # q_y_g_xz.extend(action_log_prob_with_privilege.detach().cpu().tolist())
-            # q_z_g_xy.extend(thought_entropy_with_privilege.detach().cpu().tolist())
-            # p_y_g_zx.extend(action_log_prob_without_privilege.detach().cpu().tolist())
-            all_rewards.extend(rewards.cpu().tolist())
-            all_goals.extend(goals)
-            # Store KL divergence (thought tokens) for logging
-            if not action_log_ps_as_reward:
-                kls.extend(kl_divergence.cpu().tolist())
 
             batch_idx += 1
+
+        # Second pass: compute IWAE losses per (goal, step) group
+        # Get KL penalty weight (note: gamma is used for reward tilting beta)
+        kl_penalty_weight = getattr(
+            self, "kl_penalty_weight", 0.01
+        )  # Separate from tilting beta
+
+        # Initialize results arrays indexed by batch_idx to maintain order
+        max_batch_idx = batch_idx
+        all_rewards = [None] * max_batch_idx
+        all_encoder_losses = [None] * max_batch_idx
+        all_log_importance_weights = [None] * max_batch_idx
+        kls = [None] * max_batch_idx
+        all_goals = [None] * max_batch_idx
+        # all_trajectory_indices and all_steps already filled in first pass
+
+        for goal, steps_dict in tqdm(
+            samples_by_goal_step.items(), desc="Computing IWAE losses"
+        ):
+            for step, samples in steps_dict.items():
+                K = len(samples)  # Number of trajectories at this (goal, step)
+
+                if K < 1:
+                    continue
+
+                # Collect log-probs and rewards for all K samples
+                log_q_think_list = []  # q_φ(z_k | x, h)
+                log_p_joint_list = []  # p_θ(a_k, z_k | x)
+                rewards_list = []
+                kl_list = []
+                sample_indices = []  # Track batch indices for this group
+
+                for sample_data in samples:
+                    sample_indices.append(sample_data["batch_idx"])
+                    batch = sample_data["batch"]
+                    reward = sample_data["reward"]
+                    _ = batch.pop("privileged_found", None)
+                    _ = batch.pop("goal", None)
+                    _ = batch.pop("reward", None)
+                    rewards_list.append(reward.item())
+
+                    # Extract think/action positions before batch_to_device (they're Python lists, not tensors)
+                    think_pos_with = batch["with_privilege"].pop("think_positions", [])
+                    action_pos_with = batch["with_privilege"].pop(
+                        "action_positions", []
+                    )
+                    think_pos_without = batch["without_privilege"].pop(
+                        "think_positions", []
+                    )
+                    action_pos_without = batch["without_privilege"].pop(
+                        "action_positions", []
+                    )
+
+                    utils.batch_to_device(batch, self._device)
+
+                    # Extract batches
+                    batch_with_priv = batch["with_privilege"]
+                    batch_without_priv = batch["without_privilege"]
+
+                    labels_with_priv = batch_with_priv["labels"]
+                    labels_without_priv = batch_without_priv["labels"]
+
+                    # Forward passes
+                    model_inputs_with_priv = {
+                        k: v
+                        for k, v in batch_with_priv.items()
+                        if k
+                        not in [
+                            "labels",
+                            "action_start_pos",
+                            "action_end_pos",
+                            "end_of_prompt",
+                            "mask",
+                            "attention_mask",
+                        ]
+                    }
+                    model_inputs_without_priv = {
+                        k: v
+                        for k, v in batch_without_priv.items()
+                        if k
+                        not in [
+                            "labels",
+                            "action_start_pos",
+                            "action_end_pos",
+                            "end_of_prompt",
+                            "mask",
+                            "attention_mask",
+                        ]
+                    }
+
+                    with torch.no_grad():
+                        logits_with_priv = self._model(**model_inputs_with_priv)
+                        logits_with_priv = [
+                            logit / self.sampling_temperature
+                            for logit in logits_with_priv
+                        ]
+
+                        logits_without_priv = self._ref_model(
+                            **model_inputs_without_priv
+                        )
+                        logits_without_priv = [
+                            logit / self.sampling_temperature
+                            for logit in logits_without_priv
+                        ]
+
+                    # Shift labels
+                    labels_shifted_with_priv = torch.hstack(
+                        (
+                            labels_with_priv[..., 1:],
+                            self.ignore_labels_cache[: labels_with_priv.shape[0]],
+                        )
+                    )
+                    labels_shifted_without_priv = torch.hstack(
+                        (
+                            labels_without_priv[..., 1:],
+                            self.ignore_labels_cache[: labels_without_priv.shape[0]],
+                        )
+                    )
+
+                    # Note: think/action positions already extracted before batch_to_device
+                    # think_pos_with, action_pos_with, think_pos_without, action_pos_without
+
+                    # Compute log q_φ(z_k | x, h): think tokens WITH privilege
+                    log_q_think = self._get_log_probs_for_positions(
+                        logits_with_priv, labels_with_priv, think_pos_with
+                    )
+
+                    # Compute log p_θ(z_k | x): think tokens WITHOUT privilege
+                    log_p_think = self._get_log_probs_for_positions(
+                        logits_without_priv, labels_without_priv, think_pos_without
+                    )
+
+                    # Compute log p_θ(a_k | x, z_k): action tokens WITHOUT privilege
+                    log_p_action = self._get_log_probs_for_positions(
+                        logits_without_priv, labels_without_priv, action_pos_without
+                    )
+
+                    # Track individual log-probs for logging
+                    q_z_g_xy.append(log_q_think.item())  # q_φ(z|x,h)
+                    p_z_g_xy.append(log_p_think.item())  # p_θ(z|x)
+                    p_y_g_xz.append(log_p_action.item())  # p_θ(a|x,z)
+
+
+                    log_q_think_list.append(log_q_think)
+                    log_p_joint_list.append(log_p_action)
+
+                    # Compute KL divergence for logging
+                    # try:
+                    kls_seq = [] 
+                    for think_w,think_wo in zip(think_pos_with[0], think_pos_without[0]):
+                        
+                        kls_seq.append(
+                            self._compute_kl_divergence_rao_blackwellized_masked(
+                                logits_without_priv,
+                                logits_with_priv,
+                                labels_without_priv,
+                                labels_with_priv,
+                                torch.tensor([think_w[0]]),
+                                torch.tensor([think_w[1]]),
+                                torch.tensor([think_wo[0]]),
+                                torch.tensor([think_wo[1]]),
+                                return_logprobs=False,
+                            )
+                        )
+
+                    # except Exception as e:
+                    #     kls_seq = [0]
+                    #     log.warning(
+                    #         f"Error computing KL for batch {sample_data['batch_idx']}: {e}"
+                    #     )
+                    #     kl_divergence = torch.tensor(1.0, device=self._device)
+                    kl_divergence = torch.mean(torch.stack(kls_seq))
+                    kl_list.append(kl_divergence.item())
+
+                    # Cache logprobs for importance sampling if needed
+                    if self.use_importance_sampling:
+                        ref_logprobs_chunks = self._get_sample_log_probs(
+                            logits_with_priv,
+                            labels_shifted_with_priv,
+                            return_per_token=True,
+                        )
+                        self.reference_logprobs_cache[sample_data["batch_idx"]] = (
+                            ref_logprobs_chunks
+                        )
+
+                    # Cleanup
+                    del logits_with_priv, logits_without_priv
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                # Convert to tensors
+                log_q_think = torch.stack(log_q_think_list)  # Shape: (K,)
+                log_p_joint = torch.stack(log_p_joint_list)  # Shape: (K,)
+                rewards_tensor = torch.tensor(
+                    rewards_list, device=self._device
+                )  # Shape: (K,)
+
+                # Compute importance weights WITH reward tilting
+                # w̃_k = (p_θ(a,z|x) / q_φ(z|x,h)) · exp(β·R)
+                # Note: self.gamma is used as beta (reward tilting temperature)
+                beta = self.gamma  # Reward tilting temperature
+
+                reward = rewards_tensor + beta*(log_p_action-kl_divergence)
+
+                log_weights = log_p_joint - log_q_think  # log(w_k)
+                tilted_log_weights = beta * log_weights + rewards_tensor  # log(w̃_k)
+
+                # Numerical stability: use log-sum-exp trick
+                max_log_w = tilted_log_weights.max()
+                tilted_weights = torch.exp(tilted_log_weights - max_log_w)
+
+                # Global signal: log(1/K ∑_j w̃_j)
+                mean_tilted_weight = tilted_weights.mean()
+                global_signal = torch.log(mean_tilted_weight + 1e-8) + max_log_w
+
+                # Compute baselines and encoder losses for each sample
+                for k, sample_data in enumerate(samples):
+                    batch_idx_k = sample_indices[k]  # Get the original batch index
+
+                    # Leave-one-out baseline: b_k = log(1/(K-1) ∑_{j≠k} w̃_j)
+                    if K > 1:
+                        other_weights = torch.cat(
+                            [tilted_weights[:k], tilted_weights[k + 1 :]]
+                        )
+                        baseline = torch.log(other_weights.mean() + 1e-8) + max_log_w
+                    else:
+                        baseline = global_signal
+
+                    # IWAE encoder loss for sample k:
+                    # L_k = -(global_signal - baseline) * log q_φ(z_k | x, h)
+                    advantage = global_signal - baseline
+                    encoder_loss = advantage * log_q_think[k]
+
+                    # Store results at CORRECT batch index
+                    all_encoder_losses[batch_idx_k] = encoder_loss.item()
+
+                    # Compute final reward with KL penalty
+                    # reward = task_reward - kl_penalty_weight * KL
+                    # final_reward = rewards_tensor[k] - kl_penalty_weight * kl_list[k]
+                    final_reward = advantage
+
+                    all_rewards[batch_idx_k] = min(max(final_reward.item(),-3),3)
+                    all_goals[batch_idx_k] = goal
+                    kls[batch_idx_k] = kl_list[k]
+                    all_log_importance_weights[batch_idx_k] = log_weights[k].item()
+
+        # Verify no missing entries
+        assert all(
+            r is not None for r in all_rewards
+        ), "Some batch indices have missing rewards!"
+        assert all(
+            e is not None for e in all_encoder_losses
+        ), "Some batch indices have missing encoder losses!"
+        assert all(
+            k is not None for k in kls
+        ), "Some batch indices have missing KL values!"
+        assert all(
+            g is not None for g in all_goals
+        ), "Some batch indices have missing goals!"
+
+        # Rescale rewards
         rewards = rescale_rewards(all_rewards)
         # Group rewards by goal
         rewards_by_goal = {}
@@ -726,26 +986,34 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         rewards_by_goal_step: Dict[str, Dict[int, List[Tuple[int, float]]]] = (
             defaultdict(lambda: defaultdict(list))
         )
-        for g_, tid, stp, r in zip(
-            all_goals, all_trajectory_indices, all_steps, all_rewards
-        ):
+        for batch_idx_iter in range(max_batch_idx):
+            g_ = all_goals[batch_idx_iter]
+            tid = all_trajectory_indices[batch_idx_iter]
+            stp = all_steps[batch_idx_iter]
+            r = all_rewards[batch_idx_iter]
             rewards_by_goal_step[g_][int(stp)].append((int(tid), float(r)))
 
         # Calculate advantages per sample relative to its (goal, step) group
-        advantages: List[float] = []
-        if not all_rewards:
-            advantages = []
-        else:
-            for g_, tid, stp, r in zip(
-                all_goals, all_trajectory_indices, all_steps, all_rewards
-            ):
-                grp = rewards_by_goal_step[g_][int(stp)]
-                if len(grp) > 1:
-                    mean_r = float(np.mean([rv for _, rv in grp]))
-                    advantages.append(r - mean_r)
-                else:
-                    # Single sample in group: use reward directly to avoid zero advantage
-                    advantages.append(r)
+        # Use list with indices to maintain order
+        advantages: List[float] = [None] * max_batch_idx
+        # for batch_idx_iter in range(max_batch_idx):
+        #     g_ = all_goals[batch_idx_iter]
+        #     tid = all_trajectory_indices[batch_idx_iter]
+        #     stp = all_steps[batch_idx_iter]
+        #     r = all_rewards[batch_idx_iter]
+
+        #     grp = rewards_by_goal_step[g_][int(stp)]
+        #     if len(grp) > 1:
+        #         mean_r = float(np.mean([rv for _, rv in grp]))
+        #         advantages[batch_idx_iter] = r - mean_r
+        #     else:
+        #         # Single sample in group: use reward directly to avoid zero advantage
+        #         advantages[batch_idx_iter] = r
+        advantages = all_rewards  # Use rewards directly as advantages for IWAE
+        # Verify advantages are computed
+        assert all(
+            a is not None for a in advantages
+        ), "Some batch indices have missing advantages!"
 
         # Apply control variate flip if enabled
         if self.flip_reward_control_variate:
@@ -755,22 +1023,27 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
             # Recalculate rewards_by_goal_step with flipped rewards
             rewards_by_goal_step = defaultdict(lambda: defaultdict(list))
-            for g_, tid, stp, reward in zip(
-                all_goals, all_trajectory_indices, all_steps, all_rewards
-            ):
+            for batch_idx_iter in range(max_batch_idx):
+                g_ = all_goals[batch_idx_iter]
+                tid = all_trajectory_indices[batch_idx_iter]
+                stp = all_steps[batch_idx_iter]
+                reward = all_rewards[batch_idx_iter]
                 rewards_by_goal_step[g_][int(stp)].append((int(tid), float(reward)))
 
             # Recalculate advantages with flipped rewards using (goal, step) grouping
-            advantages = []
-            for g_, tid, stp, reward in zip(
-                all_goals, all_trajectory_indices, all_steps, all_rewards
-            ):
+            advantages = [None] * max_batch_idx
+            for batch_idx_iter in range(max_batch_idx):
+                g_ = all_goals[batch_idx_iter]
+                tid = all_trajectory_indices[batch_idx_iter]
+                stp = all_steps[batch_idx_iter]
+                reward = all_rewards[batch_idx_iter]
+
                 grp = rewards_by_goal_step[g_][int(stp)]
                 if len(grp) > 1:
                     mean_r = float(np.mean([rv for _, rv in grp]))
-                    advantages.append(reward - mean_r)
+                    advantages[batch_idx_iter] = reward - mean_r
                 else:
-                    advantages.append(reward)
+                    advantages[batch_idx_iter] = reward
 
             log.info(
                 f"Original reward range: [{min(original_rewards):.4f}, {max(original_rewards):.4f}]"
@@ -779,19 +1052,23 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 f"Flipped reward range: [{min(all_rewards):.4f}, {max(all_rewards):.4f}]"
             )
             # Explicitly delete large tensors and clear cache
-        del logits_with_priv
-        del logits_without_priv
-        del labels_with_priv
-        del labels_without_priv
-        del labels_shifted_with_priv
-        del labels_shifted_without_priv
-        del reward
-        del kl_divergence
-        if self.use_importance_sampling:
-            del ref_logprobs_chunks_q
-        p_y_g_xz_mean = np.mean(p_y_g_zx)
-        q_y_g_xz_mean = np.mean(q_y_g_xz)
-        q_z_g_xy_mean = np.mean(q_z_g_xy)
+        p_y_g_xz_mean = np.mean(p_y_g_xz) if p_y_g_xz else 0.0
+        p_z_g_xy_mean = np.mean(p_z_g_xy) if p_z_g_xy else 0.0
+        q_z_g_xy_mean = np.mean(q_z_g_xy) if q_z_g_xy else 0.0
+
+        # Log IWAE statistics
+        if self._is_rank_zero and all_log_importance_weights:
+            log.info(
+                f"IWAE log-ratio stats - Mean: {np.mean(all_log_importance_weights):.4f}, Std: {np.std(all_log_importance_weights):.4f}"
+            )
+            log.info(
+                f"IWAE encoder loss stats - Mean: {np.mean(all_encoder_losses):.4f}, Std: {np.std(all_encoder_losses):.4f}"
+            )
+            log.info(f"Reward tilting beta (gamma): {self.gamma:.4f}")
+            log.info(f"Log-prob stats:")
+            log.info(f"  p_θ(a|x,z) mean: {p_y_g_xz_mean:.4f}")
+            log.info(f"  p_θ(z|x) mean: {p_z_g_xy_mean:.4f}")
+            log.info(f"  q_φ(z|x,h) mean: {q_z_g_xy_mean:.4f}")
 
         self._model.train()
         if self.reference_set:
@@ -801,11 +1078,12 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             all_rewards,
             advantages,
             p_y_g_xz_mean,
-            q_y_g_xz_mean,
+            p_z_g_xy_mean,
             q_z_g_xy_mean,
             rewards_by_goal,
             kls,
-            p_y_g_zx,
+            all_log_importance_weights,
+            all_encoder_losses,
         )
 
     def compute_rewards_offline(
@@ -835,9 +1113,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             A tuple containing:
             - A list of rewards for each sample (original + KL penalty).
             - A list of advantages for each sample.
-            - Mean log probability of action tokens without privilege (p_y_g_zx_mean).
-            - Mean log probability of action tokens with privilege (q_y_g_xz_mean).
-            - Mean entropy of thought tokens with privilege (q_z_g_xy_mean).
+            - Mean log probability of action tokens without privilege (p_y_g_xz_mean).
+            - Mean log probability of think tokens with privilege (q_z_g_xy_mean).
             - Dictionary of rewards grouped by goal.
             - A list of KL divergences for each sample (thought tokens only).
         """
@@ -1100,7 +1377,6 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             )
 
         p_y_g_xz_mean = np.mean(p_y_g_zx)
-        q_y_g_xz_mean = np.mean(q_y_g_xz)
         q_z_g_xy_mean = np.mean(q_z_g_xy)
 
         self._model.train()
@@ -1111,7 +1387,6 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             all_rewards,
             advantages,
             p_y_g_xz_mean,
-            q_y_g_xz_mean,
             q_z_g_xy_mean,
             rewards_by_goal,
             kls,
@@ -1672,12 +1947,13 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             (
                 all_rewards,
                 all_advantages,
-                p_y_g_zx_mean,
-                q_y_g_xz_mean,
+                p_y_g_xz_mean,
+                p_z_g_xy_mean,
                 q_z_g_xy_mean,
                 rewards_by_goal,
                 kls,
-                p_y_g_zx_all,
+                all_log_importance_weights,
+                all_encoder_losses,
             ) = self.compute_rewards()
 
             # TODO: This is hacky need a better way to do this but this will work for now
@@ -1701,7 +1977,12 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                         "kl_divergence_mean": kl_mean,
                         "kl_divergence_std": kl_std,
                         "reward_mean": np.mean(all_rewards),
+                        "reward_max": np.max(all_rewards),
+                        "reward_min": np.min(all_rewards),
                         "reward_std": np.std(all_rewards),
+                        "p_y_g_xz_mean": p_y_g_xz_mean,
+                        "p_z_g_xy_mean": p_z_g_xy_mean,
+                        "q_z_g_xy_mean": q_z_g_xy_mean,
                     },
                     step=self.global_step,
                 )
@@ -1937,9 +2218,9 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                             ),
                             "tokens_per_second_per_gpu": real_num_tokens  # NOTE: added by us
                             / (time_per_step * world_size),
-                            "q_y_g_xz_mean": q_y_g_xz_mean,
+                            "p_y_g_xz_mean": p_y_g_xz_mean,
+                            "p_z_g_xy_mean": p_z_g_xy_mean,
                             "q_z_g_xy_mean": q_z_g_xy_mean,
-                            "p_y_g_zx_mean": p_y_g_zx_mean,
                         }
                         # Add gradient norm stats to logging
                         log_dict.update(grad_norm_stats)
@@ -2183,12 +2464,20 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
         labels: torch.Tensor,
         advantages: torch.Tensor,
         ref_logits: Optional[List[torch.Tensor]] = None,
+        og_reward: Optional[torch.Tensor] = None,
+        use_sft_positive: bool = False,
     ) -> torch.Tensor:
         """
-        Calculate TOPR (Tapered Off-Policy Reinforcement Learning) loss.
+        Calculate TOPR (Tapered Off-Policy Reinforcement Learning) loss or SFT loss.
 
-        For positive advantages (A > 0): SFT loss weighted by advantage
-        For negative advantages (A ≤ 0): Truncated Importance Sampling (TIS)
+        Standard TOPR mode (use_sft_positive=False):
+            For positive advantages (A > 0): SFT loss weighted by advantage
+            For negative advantages (A ≤ 0): Truncated Importance Sampling (TIS)
+
+        SFT on positive trajectories mode (use_sft_positive=True):
+            If og_reward == 1: Apply SFT loss (weight = 1.0)
+            Otherwise: Zero out the loss (weight = 0.0)
+            This keeps DDP synchronized while only training on positive samples.
 
         From the paper: https://arxiv.org/pdf/2503.14286
         ∇J_topr(π) = Σ_{τ∈T+} μ(τ)R(τ)∇log π(τ) + Σ_{τ∈T-} μ(τ) * clip(π/μ, ε_low, ε_high) * R(τ) * ∇log π(τ)
@@ -2198,9 +2487,11 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             labels: Ground truth labels
             advantages: Advantage values per sample
             ref_logits: Optional reference policy logits for TIS (used for negative advantages)
+            og_reward: Original reward signal (0 or 1) for SFT positive mode
+            use_sft_positive: If True, only train on positive trajectories (og_reward == 1)
 
         Returns:
-            Combined TORPO loss (summed over valid tokens)
+            Combined TORPO/SFT loss (summed over valid tokens)
         """
         import torch.nn.functional as F
 
@@ -2243,11 +2534,35 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
         # Handle empty case
         if not policy_log_ps_list:
-            return torch.tensor(0.0, device=logits[0].device)
+            return torch.tensor(0.0, device=logits[0].device, requires_grad=True)
 
         # Concatenate all valid tokens
         policy_log_ps = torch.cat(policy_log_ps_list)
 
+        # ===== SFT on Positive Trajectories Mode =====
+        if use_sft_positive:
+            # Determine weight: 1.0 if positive (og_reward == 1), else 0.0
+            if og_reward is not None:
+                weight = torch.where(
+                    og_reward == 1.0,
+                    torch.ones_like(og_reward, dtype=policy_log_ps.dtype),
+                    torch.zeros_like(og_reward, dtype=policy_log_ps.dtype),
+                )
+            else:
+                weight = torch.ones_like(advantages, dtype=policy_log_ps.dtype)
+
+            # Standard SFT loss: -log π(τ), weighted by trajectory quality
+            # This ensures DDP stays synchronized even when weight is 0
+            weight = weight.to(policy_log_ps.device)
+            sft_loss = -(weight * policy_log_ps).sum()
+
+            log.info(
+                f"SFT positive loss: {sft_loss.item():.4f}, "
+                f"Weight: {weight.item():.1f} (og_reward={og_reward.item() if og_reward is not None else 'N/A'})"
+            )
+            return sft_loss
+
+        # ===== Standard TOPR Mode =====
         # Separate positive and negative advantages
         positive_mask = advantages > 0
         negative_mask = advantages <= 0
@@ -2352,31 +2667,34 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             self._model.eval()
             self._ref_model.eval()
 
-            with torch.no_grad():
-                for i, dataloader_validation in enumerate(
-                    self._dataloader_validation_list
-                ):
-                    for _, batch in enumerate(dataloader_validation):
-                        batch.pop("goal", None)
-                        batch.pop("privileged_found", None)
-                        utils.batch_to_device(batch, self._device)
-                        val_loss = torch.tensor(0.0, device=self._device)
-                        if self._is_rank_zero:
-                            self._metric_logger.log_dict(
-                                {f"val_loss_{i}": val_loss.item()},
-                                step=self.global_step,
-                            )
-            del val_loss
+            # with torch.no_grad():
+            #     for i, dataloader_validation in enumerate(
+            #         self._dataloader_validation_list
+            #     ):
+            #         for _, batch in enumerate(dataloader_validation):
+            #             batch.pop("goal", None)
+            #             batch.pop("privileged_found", None)
+
+            #             utils.batch_to_device(batch, self._device)
+            #             val_loss = torch.tensor(0.0, device=self._device)
+            #             if self._is_rank_zero:
+            #                 self._metric_logger.log_dict(
+            #                     {f"val_loss_{i}": val_loss.item()},
+            #                     step=self.global_step,
+            #                 )
+            # del val_loss
+
             # ------ Reward and Advantage Computation ------ #
             (
                 all_rewards,
                 all_advantages,
-                p_y_g_zx_mean,
-                q_y_g_xz_mean,
+                p_y_g_xz_mean,
+                p_z_g_xy_mean,
                 q_z_g_xy_mean,
                 rewards_by_goal,
                 kls,
-                p_y_g_zx_all,
+                all_log_importance_weights,
+                all_encoder_losses,
             ) = self.compute_rewards()
 
             # TODO: This is hacky need a better way to do this but this will work for now
@@ -2400,6 +2718,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                         "kl_divergence_mean": kl_mean,
                         "kl_divergence_std": kl_std,
                         "reward_mean": np.mean(all_rewards),
+                        "reward_max": np.max(all_rewards),
+                        "reward_min": np.min(all_rewards),
                         "reward_std": np.std(all_rewards),
                     },
                     step=self.global_step,
@@ -2475,6 +2795,17 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                 batch.pop("goal", None)
                 batch.pop("privileged_found", None)
                 og_reward = batch.pop("og_reward", None)
+
+                # Pop list fields from nested dicts before batch_to_device
+                think_pos_with = batch["with_privilege"].pop("think_positions", None)
+                action_pos_with = batch["with_privilege"].pop("action_positions", None)
+                think_pos_without = batch["without_privilege"].pop(
+                    "think_positions", None
+                )
+                action_pos_without = batch["without_privilege"].pop(
+                    "action_positions", None
+                )
+
                 utils.batch_to_device(batch, self._device)
 
                 # Calculate the number of unmasked tokens in the current batch
@@ -2653,7 +2984,23 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                     )
 
                     # Choose loss function based on configuration
-                    if self.train_p_loss == "trpo":
+                    if self.train_p_loss == "sft_positive":
+                        log.info(
+                            "Using SFT on positive trajectories for P model training"
+                        )
+                        combined_loss_np = self.calculate_topr_loss(
+                            logits=(
+                                logits_np
+                                if isinstance(logits_np, list)
+                                else [logits_np]
+                            ),
+                            labels=labels_np,
+                            advantages=advantages,
+                            ref_logits=None,  # Not needed for SFT mode
+                            og_reward=og_reward,  # Pass the original reward
+                            use_sft_positive=True,  # Enable SFT mode
+                        )
+                    elif self.train_p_loss == "trpo":
                         log.info("Using TORPO loss for P model training")
                         # For TORPO, we need reference logits for negative advantages
                         ref_logits_np = None
@@ -2667,7 +3014,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
 
                         combined_loss_np = self.calculate_topr_loss(
                             logits=(
-                                logits_with_priv
+                                logits_np
                                 if isinstance(logits_np, list)
                                 else [logits_np]
                             ),
@@ -2834,10 +3181,10 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                             / (time_per_step * world_size),
                             "agent_num_tokens_avg": agent_num_tokens_avg,
                             "total_num_tokens_avg": total_num_tokens_avg,
-                            # Token stats (per local step)
-                            "q_y_g_xz_mean": q_y_g_xz_mean,
+                            # Log-prob stats (per epoch)
+                            "p_y_g_xz_mean": p_y_g_xz_mean,
+                            "p_z_g_xy_mean": p_z_g_xy_mean,
                             "q_z_g_xy_mean": q_z_g_xy_mean,
-                            "p_y_g_zx_mean": p_y_g_zx_mean,
                         }
 
                         # Aggregate PPO clipping statistics
@@ -3008,8 +3355,7 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
             (
                 all_rewards,
                 all_advantages,
-                p_y_g_zx_mean,
-                q_y_g_xz_mean,
+                p_y_g_xz_mean,
                 q_z_g_xy_mean,
                 rewards_by_goal,
                 kls,
@@ -3037,6 +3383,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                         "kl_divergence_mean": kl_mean,
                         "kl_divergence_std": kl_std,
                         "reward_mean": np.mean(all_rewards),
+                        "reward_max": np.max(all_rewards),
+                        "reward_min": np.min(all_rewards),
                         "reward_std": np.std(all_rewards),
                     },
                     step=self.global_step,
@@ -3256,9 +3604,8 @@ class FullFinetuneRecipeDistributedPrivalaged(FullFinetuneRecipeDistributed):
                             ),
                             "tokens_per_second_per_gpu": real_num_tokens  # NOTE: added by us
                             / (time_per_step * world_size),
-                            "q_y_g_xz_mean": q_y_g_xz_mean,
+                            "p_y_g_xz_mean": p_y_g_xz_mean,
                             "q_z_g_xy_mean": q_z_g_xy_mean,
-                            "p_y_g_zx_mean": p_y_g_zx_mean,
                         }
                         # Add gradient norm stats to logging
                         log_dict.update(grad_norm_stats)
