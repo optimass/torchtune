@@ -95,6 +95,251 @@ class priv_dataloader_online(Dataset):
             privileged_found,
         )
 
+    def _parse_assistant_content(self, content: str) -> List[tuple]:
+        """
+        Parse assistant message content into ordered segments.
+
+        Args:
+            content: The text content from an assistant message
+
+        Returns:
+            List of (segment_type, segment_text) tuples where segment_type is:
+            - "think": <think>...</think> block
+            - "action": <action>...</action> block
+            - "other": everything else
+        """
+        think_pattern = r"<think>.*?</think>"
+        action_pattern = r"<action>.*?</action>"
+
+        # Find all matches with their positions
+        think_matches = [
+            (m.start(), m.end(), "think", m.group(0))
+            for m in re.finditer(think_pattern, content, re.DOTALL)
+        ]
+        action_matches = [
+            (m.start(), m.end(), "action", m.group(0))
+            for m in re.finditer(action_pattern, content, re.DOTALL)
+        ]
+
+        # Combine and sort by position
+        all_matches = sorted(think_matches + action_matches, key=lambda x: x[0])
+
+        if not all_matches:
+            # No think/action blocks, return entire content as "other"
+            return [("other", content)] if content else []
+
+        segments = []
+        last_end = 0
+
+        for start, end, match_type, matched_text in all_matches:
+            # Add text before this match
+            if start > last_end:
+                before_text = content[last_end:start]
+                if before_text:
+                    segments.append(("other", before_text))
+
+            # Add the matched segment
+            segments.append((match_type, matched_text))
+            last_end = end
+
+        # Add remaining text after last match
+        if last_end < len(content):
+            remaining = content[last_end:]
+            if remaining:
+                segments.append(("other", remaining))
+
+        return segments
+
+    def _tokenize_messages_with_positions(
+        self,
+        messages: List[Message],
+        add_eos: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Tokenize messages while tracking think and action token positions.
+        This mimics the tokenizer's tokenize_messages but adds position tracking.
+
+        Returns:
+            Dict containing:
+                - tokens: List[int]
+                - mask: List[bool]
+                - think_positions: List[Tuple[int, int]]
+                - action_positions: List[Tuple[int, int]]
+        """
+        tokenizer = self._model_transform
+
+        # Apply template if present
+        if (
+            hasattr(tokenizer, "prompt_template")
+            and tokenizer.prompt_template is not None
+        ):
+            templated_messages = tokenizer.prompt_template(messages)
+        else:
+            templated_messages = messages
+
+        tokenized_messages = []
+        mask = []
+        think_positions = []
+        action_positions = []
+
+        for i, message in enumerate(templated_messages):
+            # Tokenize header (always masked)
+            if hasattr(tokenizer, "_tokenize_header"):
+                header_tokens = tokenizer._tokenize_header(templated_messages, i)
+            else:
+                # Fallback for other tokenizers
+                header_tokens = self._tokenize_header_fallback(message)
+
+            tokenized_messages.extend(header_tokens)
+            mask.extend([True] * len(header_tokens))
+
+            # Process message content
+            for item in message.content:
+                if item["type"] == "text":
+                    content_text = item["content"]
+
+                    # If this is an assistant message, parse for think/action segments
+                    if message.role == "assistant":
+                        segments = self._parse_assistant_content(content_text)
+
+                        for seg_type, seg_text in segments:
+                            start_pos = len(tokenized_messages)
+
+                            # Encode segment
+                            seg_tokens = tokenizer.encode(
+                                seg_text,
+                                add_bos=False,
+                                add_eos=False,
+                            )
+
+                            tokenized_messages.extend(seg_tokens)
+                            mask.extend([message.masked] * len(seg_tokens))
+
+                            end_pos = len(tokenized_messages)
+
+                            # Track positions for think/action (excluding tag tokens)
+                            if seg_type == "think":
+                                # Calculate tag token lengths
+                                opening_tag_tokens = len(
+                                    tokenizer.encode(
+                                        "<think>", add_bos=False, add_eos=False
+                                    )
+                                )
+                                closing_tag_tokens = len(
+                                    tokenizer.encode(
+                                        "\n\n/think>", add_bos=False, add_eos=False
+                                    )
+                                )
+                                # Adjust positions to exclude tags
+                                content_start = start_pos + opening_tag_tokens
+                                content_end = end_pos - closing_tag_tokens
+                                think_positions.append((content_start, content_end))
+                            elif seg_type == "action":
+                                # Calculate tag token lengths
+                                opening_tag_tokens = len(
+                                    tokenizer.encode(
+                                        "<action>", add_bos=False, add_eos=False
+                                    )
+                                )
+                                closing_tag_tokens = len(
+                                    tokenizer.encode(
+                                        "</action>", add_bos=False, add_eos=False
+                                    )
+                                )
+                                # Adjust positions to exclude tags
+                                content_start = start_pos + opening_tag_tokens
+                                content_end = end_pos - closing_tag_tokens
+                                action_positions.append((content_start, content_end))
+                    else:
+                        # For non-assistant messages, encode normally
+                        content_tokens = tokenizer.encode(
+                            content_text,
+                            add_bos=False,
+                            add_eos=False,
+                        )
+                        tokenized_messages.extend(content_tokens)
+                        mask.extend([message.masked] * len(content_tokens))
+                else:
+                    raise RuntimeError(
+                        f"Unsupported message content type: {item['type']}"
+                    )
+
+            # Tokenize footer (always masked)
+            if hasattr(tokenizer, "_tokenize_footer"):
+                footer_tokens = tokenizer._tokenize_footer(templated_messages, i)
+            else:
+                # Fallback for other tokenizers
+                footer_tokens = self._tokenize_footer_fallback(
+                    message, i, len(templated_messages)
+                )
+
+            tokenized_messages.extend(footer_tokens)
+            mask.extend([True] * len(footer_tokens))
+
+            # Break early if max_seq_len reached
+            if hasattr(tokenizer, "max_seq_len") and tokenizer.max_seq_len:
+                if len(tokenized_messages) >= tokenizer.max_seq_len:
+                    break
+
+        # Add EOS token
+        if add_eos and hasattr(tokenizer, "eos_id"):
+            tokenized_messages.append(tokenizer.eos_id)
+            mask.append(mask[-1] if mask else True)
+
+        # Truncate if necessary
+        if hasattr(tokenizer, "max_seq_len") and tokenizer.max_seq_len:
+            from torchtune.data import truncate
+
+            eos_id = (
+                tokenizer.eos_id if add_eos and hasattr(tokenizer, "eos_id") else None
+            )
+            tokenized_messages = truncate(
+                tokenized_messages, tokenizer.max_seq_len, eos_id
+            )
+            mask = truncate(mask, tokenizer.max_seq_len, True if add_eos else None)
+
+        return {
+            "tokens": tokenized_messages,
+            "mask": mask,
+            "think_positions": think_positions,
+            "action_positions": action_positions,
+        }
+
+    def _tokenize_header_fallback(self, message: Message) -> List[int]:
+        """Fallback header tokenization for tokenizers without _tokenize_header."""
+        tokenizer = self._model_transform
+        tokens = []
+
+        # Try to use im_start_id if available (Qwen-style)
+        if hasattr(tokenizer, "im_start_id"):
+            tokens.append(tokenizer.im_start_id)
+
+        tokens.extend(
+            tokenizer.encode(
+                f"{message.role}\n",
+                add_bos=False,
+                add_eos=False,
+            )
+        )
+        return tokens
+
+    def _tokenize_footer_fallback(
+        self, message: Message, idx: int, total: int
+    ) -> List[int]:
+        """Fallback footer tokenization for tokenizers without _tokenize_footer."""
+        tokenizer = self._model_transform
+        tokens = []
+
+        # Add end token if available
+        if hasattr(tokenizer, "im_end_id"):
+            tokens.append(tokenizer.im_end_id)
+
+        # Add newline for non-final assistant messages
+        if message.role != "assistant" or idx != total - 1:
+            tokens.extend(tokenizer.encode("\n", add_bos=False, add_eos=False))
+
+        return tokens
+
     def _prepare_sample(self, sample: Mapping[str, Any]) -> Dict[str, Any]:
 
         sample_without_privileged = copy.deepcopy(sample)
@@ -109,15 +354,31 @@ class priv_dataloader_online(Dataset):
         transformed_sample_without_privileged = self._message_transform(
             sample_without_privileged
         )
-        # if "messages" in transformed_sample_with_privilege:
-        #     validate_messages(transformed_sample_with_privilege["messages"])
 
-        tokenized_dict_with_privilege = self._model_transform(
-            transformed_sample_with_privilege
-        )
-        tokenized_dict_without_privilege = self._model_transform(
-            transformed_sample_without_privileged
-        )
+        # Check if we have messages (for the new tokenization path)
+        if "messages" in transformed_sample_with_privilege:
+            # Use custom tokenization that tracks think/action positions
+            tokenized_dict_with_privilege = self._tokenize_messages_with_positions(
+                transformed_sample_with_privilege["messages"],
+                add_eos=True,
+            )
+            tokenized_dict_without_privilege = self._tokenize_messages_with_positions(
+                transformed_sample_without_privileged["messages"],
+                add_eos=True,
+            )
+        else:
+            # Fallback to old tokenization (for backward compatibility)
+            tokenized_dict_with_privilege = self._model_transform(
+                transformed_sample_with_privilege
+            )
+            tokenized_dict_without_privilege = self._model_transform(
+                transformed_sample_without_privileged
+            )
+            # Add empty position lists for backward compatibility
+            tokenized_dict_with_privilege["think_positions"] = []
+            tokenized_dict_with_privilege["action_positions"] = []
+            tokenized_dict_without_privilege["think_positions"] = []
+            tokenized_dict_without_privilege["action_positions"] = []
 
         if not (
             "tokens" in tokenized_dict_with_privilege
@@ -156,9 +417,9 @@ class priv_dataloader_online(Dataset):
             "with_privilege": tokenized_dict_with_privilege,
             "without_privilege": tokenized_dict_without_privilege,
             "privileged_found": privileged_found,
-            'reward': sample['reward'],
-            'og_reward': sample['og_reward'],
-            "goal" : sample['instruction']  
+            "reward": sample["reward"],
+            "og_reward": sample["og_reward"],
+            "goal": sample["instruction"],
         }
 
         return return_dict

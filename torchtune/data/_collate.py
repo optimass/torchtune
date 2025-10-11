@@ -1161,6 +1161,7 @@ def _collate_privilege_side(
     Pad a single side (with_privilege/without_privilege) for the online dataset.
 
     Expects entries to have at least "tokens" and either "labels" or "mask".
+    Optionally includes "think_positions" and "action_positions".
     Pads right to the max length, aligns tensors, and applies optional
     context-parallel multiple padding.
     """
@@ -1210,11 +1211,18 @@ def _collate_privilege_side(
         mask = _right_pad_to_multiple(mask, dim=1, multiple=min_mult, pad_value=True)
 
     attention_mask = (~mask).to(torch.long)
+
+    # Collect think_positions and action_positions (list of lists of tuples)
+    think_positions = [x.get("think_positions", []) for x in side_batch]
+    action_positions = [x.get("action_positions", []) for x in side_batch]
+
     return {
         "tokens": tokens.long(),
         "labels": labels.long(),
         "mask": mask.bool(),
         "attention_mask": attention_mask,
+        "think_positions": think_positions,
+        "action_positions": action_positions,
     }
 
 
@@ -1227,12 +1235,18 @@ def padded_collate_privilege_online(
     Collate for online privilege dataset samples.
 
     Expected per-sample structure:
-      - "with_privilege": {"tokens", "labels"?, "mask"?}
-      - "without_privilege": {"tokens", "labels"?, "mask"?}
+      - "with_privilege": {"tokens", "labels"?, "mask"?, "think_positions"?, "action_positions"?}
+      - "without_privilege": {"tokens", "labels"?, "mask"?, "think_positions"?, "action_positions"?}
       - "privileged_found": int flag (0/1)
+      - "reward": float
+      - "og_reward": float
+      - "goal": str
 
-    Returns nested dicts for each side with tokens/labels/mask/attention_mask,
+    Returns nested dicts for each side with tokens/labels/mask/attention_mask/think_positions/action_positions,
     CP/TP padded if configured via set_min_seq_multiple or TUNE_MIN_SEQ_MULTIPLE.
+
+    The think_positions and action_positions are lists of tuples [(start, end), ...] indicating
+    the token positions of <think> and <action> blocks in the sequence.
     """
     with_priv = _collate_privilege_side(
         [x["with_privilege"] for x in batch],
@@ -1254,12 +1268,12 @@ def padded_collate_privilege_online(
         [float(x.get("og_reward", 0.0)) for x in batch], dtype=torch.float32
     )
     goals = [x.get("goal", "") for x in batch]
-   
+
     return {
         "with_privilege": with_priv,
         "without_privilege": without_priv,
         "privileged_found": priv_found,
         "reward": rewards,
         "og_reward": og_rewards,
-        'goal': goals,
+        "goal": goals,
     }
