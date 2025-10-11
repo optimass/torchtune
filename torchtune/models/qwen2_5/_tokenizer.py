@@ -38,6 +38,7 @@ QWEN2_5_SPECIAL_TOKENS = {
     "<|file_sep|>": 151664,
 }
 
+
 class Qwen2_5Tokenizer(Qwen2Tokenizer):  # noqa: N801
     """This class construct a Qwen2.5 tokenizer, based on GPT-2 byte-level BPE tokenization.
 
@@ -149,29 +150,30 @@ class Qwen2_5Tokenizer(Qwen2Tokenizer):  # noqa: N801
         tokenized_messages = []
         mask = []
         for i, message in enumerate(templated_messages):
-            # message header
-            tokens = self._tokenize_header(templated_messages, i)
+            # message header - always mask headers
+            header_tokens = self._tokenize_header(templated_messages, i)
+            tokenized_messages.extend(header_tokens)
+            mask.extend([True] * len(header_tokens))
 
-            # message content
+            # message content - use message.masked
             for item in message.content:
                 if item["type"] == "text":
-                    tokens.extend(
-                        self.encode(
-                            item["content"],
-                            add_bos=False,
-                            add_eos=False,
-                        )
+                    content_tokens = self.encode(
+                        item["content"],
+                        add_bos=False,
+                        add_eos=False,
                     )
+                    tokenized_messages.extend(content_tokens)
+                    mask.extend([message.masked] * len(content_tokens))
                 else:
                     raise RuntimeError(
                         f"Unsupported message content type: {item['type']}"
                     )
 
-            # message footer
-            tokens.extend(self._tokenize_footer(templated_messages, i))
-
-            tokenized_messages.extend(tokens)
-            mask.extend([message.masked] * len(tokens))
+            # message footer - always mask footers
+            footer_tokens = self._tokenize_footer(templated_messages, i)
+            tokenized_messages.extend(footer_tokens)
+            mask.extend([True] * len(footer_tokens))
 
             # Break out early if we reach max_seq_len
             if self.max_seq_len and len(tokenized_messages) >= self.max_seq_len:

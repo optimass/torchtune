@@ -237,7 +237,7 @@ def qwen3_8b_instruct() -> TransformerDecoder:
         num_kv_heads=8,
         embed_dim=4096,
         intermediate_dim=12288,
-        max_seq_len=40960,
+        max_seq_len=120960,
         head_dim=128,
         attn_dropout=0.0,
         norm_eps=1e-6,

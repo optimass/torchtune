@@ -92,11 +92,9 @@ class _CheckpointerInterface(Protocol):
 
     """
 
-    def load_checkpoint(self, **kwargs) -> Dict[str, Any]:
-        ...
+    def load_checkpoint(self, **kwargs) -> Dict[str, Any]: ...
 
-    def save_checkpoint(self, state_dict: Dict[str, Any], **kwargs) -> None:
-        ...
+    def save_checkpoint(self, state_dict: Dict[str, Any], **kwargs) -> None: ...
 
 
 class FullModelTorchTuneCheckpointer(_CheckpointerInterface):
@@ -476,7 +474,7 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                 dim=self._config["hidden_size"],
                 tie_word_embeddings=self._config["tie_word_embeddings"],
             )
-        
+
         elif self._model_type == ModelType.LLAMA3_VISION:
             from torchtune.models.llama3_2_vision._convert_weights import (
                 llama3_vision_hf_to_tune,
@@ -589,7 +587,17 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                     dim=self._config["hidden_size"],
                     tie_word_embeddings=self._config["tie_word_embeddings"],
                 )
-                
+                # Qwen3-4B specifically has tied embeddings but lm_head.weight is missing from checkpoint
+                # Add it to weight_map to avoid KeyError during save
+                if (
+                    "Qwen3-4B" in str(self._checkpoint_dir)
+                    and "lm_head.weight" not in self._weight_map
+                ):
+                    # Assign to same checkpoint file as tok_embeddings.weight
+                    self._weight_map["lm_head.weight"] = self._weight_map.get(
+                        "tok_embeddings.weight", "0001"
+                    )
+
             elif self._model_type == ModelType.LLAMA3_VISION:
                 from torchtune.models.llama3_2_vision._convert_weights import (
                     llama3_vision_tune_to_hf,
@@ -682,14 +690,14 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                     "Saving Llama3.2 Vision adapter weights to PEFT format is not supported, saving to torchtune format instead"
                 )
             else:
-                state_dict[
-                    training.ADAPTER_KEY
-                ] = convert_weights.tune_to_peft_adapter_weights(
-                    state_dict[training.ADAPTER_KEY],
-                    num_heads=self._config["num_attention_heads"],
-                    num_kv_heads=self._config["num_key_value_heads"],
-                    dim=self._config["hidden_size"],
-                    head_dim=self._config.get("head_dim", None),
+                state_dict[training.ADAPTER_KEY] = (
+                    convert_weights.tune_to_peft_adapter_weights(
+                        state_dict[training.ADAPTER_KEY],
+                        num_heads=self._config["num_attention_heads"],
+                        num_kv_heads=self._config["num_key_value_heads"],
+                        dim=self._config["hidden_size"],
+                        head_dim=self._config.get("head_dim", None),
+                    )
                 )
                 peft_output_path = Path.joinpath(
                     self._output_dir, "adapter_model"
@@ -715,10 +723,10 @@ class FullModelHFCheckpointer(_CheckpointerInterface):
                     "PEFT integration for Llama3.2 Vision is not supported, skipping adapter config save"
                 )
             else:
-                state_dict[
-                    training.ADAPTER_CONFIG
-                ] = convert_weights.tune_to_peft_adapter_config(
-                    state_dict[training.ADAPTER_CONFIG]
+                state_dict[training.ADAPTER_CONFIG] = (
+                    convert_weights.tune_to_peft_adapter_config(
+                        state_dict[training.ADAPTER_CONFIG]
+                    )
                 )
                 output_path = Path.joinpath(self._output_dir, "adapter_config.json")
                 with open(output_path, "w") as f:

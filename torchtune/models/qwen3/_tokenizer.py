@@ -18,8 +18,8 @@ QWEN3_SPECIAL_TOKENS = {
     **QWEN2_5_SPECIAL_TOKENS,
     "<tool_response>": 151665,
     "</tool_response>": 151666,
-    "<think>": 151667,
-    "</think>": 151668,
+    # "<think>": 151667,
+    # "</think>": 151668,
 }
 
 

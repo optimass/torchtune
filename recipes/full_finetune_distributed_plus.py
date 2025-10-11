@@ -155,7 +155,8 @@ class FullFinetuneRecipeDistributedPlus(FullFinetuneRecipeDistributed):
                 # Forward pass through reference model
                 ref_logits = self._model(**batch)
                 if self.divide_logits_with_temp:
-                        logits /= self.sampling_temperature
+                    ref_logits = [logit / self.sampling_temperature for logit in ref_logits]
+                    
 
                 # Shift labels as in training loop
                 shifted_labels = torch.hstack(
@@ -425,7 +426,8 @@ class FullFinetuneRecipeDistributedPlus(FullFinetuneRecipeDistributed):
                 with self.activations_handling_ctx:
                     logits = self._model(**batch)
                     if self.divide_logits_with_temp:
-                        logits /= self.sampling_temperature
+                        logits = [logit / self.sampling_temperature for logit in logits]
+
 
 
                 if self.use_reference:

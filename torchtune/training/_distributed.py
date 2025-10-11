@@ -848,8 +848,8 @@ def get_context_parallel_manager(
         raise ValueError("Context parallel is only supported for text models")
     # TODO: this is a hacky proxy for whether we use flex for chunked attention
     # remove this once flex is supported
-    if enabled and any([layer.mask_mod is not None for layer in model.layers]):
-        raise ValueError("Context parallel with flex attention is not yet supported")
+    # if enabled and any([layer.mask_mod is not None for layer in model.layers]):
+    #     raise ValueError("Context parallel with flex attention is not yet supported")
 
     @contextlib.contextmanager
     def context(model_inputs: list[torch.Tensor]):

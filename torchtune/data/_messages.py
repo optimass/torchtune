@@ -199,6 +199,13 @@ class InputOutputToMessages(Transform):
         self.image_dir = image_dir
 
     def __call__(self, sample: Mapping[str, Any]) -> Mapping[str, Any]:
+        if 'traj' in sample:
+            return self.__call__multiple__(sample['traj'])
+        else:
+            return self.__call__single__(sample)
+
+    
+    def __call__single__(self, sample: Mapping[str, Any]) -> Mapping[str, Any]:
         is_multimodal = "image" in sample or (
             "image" in self.column_map and self.column_map["image"] in sample
         )
@@ -245,6 +252,14 @@ class InputOutputToMessages(Transform):
             ] + messages
         return {"messages": messages}
 
+    def __call__multiple__(self, samples: List[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+        messages = []
+        for sample in samples:
+            role = sample['role']
+            messages.append(Message(role=role, content=sample['content'], masked= role != 'assistant',eot=True))
+            
+
+        return {"messages": messages}
 
 class ChosenRejectedToMessages(Transform):
     """
